@@ -6,20 +6,27 @@ SSH (`docker save | ssh | docker load`), runs it, and health-checks it.
 
 ## Prerequisites
 
-1. An EC2 host with Docker installed and reachable over SSH from the Jenkins agent
-   (`bootstrap/provision-ec2.sh` launches one, with `bootstrap/cloud-init-docker.sh` as its
-   user-data). Security group needs inbound SSH (22) and whatever `HOST_PORT` you deploy on.
-2. An SSH key credential in Jenkins (Manage Jenkins → Credentials) that can log into that host,
-   with the credential ID matching the `SSH_CREDENTIALS_ID` parameter (defaults to
-   `ec2-deploy-key`).
-3. The `docker deployment` agent from `project-8/jenkins-api-server-agent` — it already has
-   Docker and SSH available.
+1. A keypair from `../agent-keys/generate-and-store.sh <name>` — it prints a `date_name`
+   (e.g. `2026-09-17_web-host`), imports the public key into AWS, and stores both halves in
+   Vault. See `../agent-keys/README.md`.
+2. An EC2 host launched with that keypair and Docker installed, reachable over SSH from the
+   Jenkins agent (`bootstrap/provision-ec2.sh` launches one, with `bootstrap/cloud-init-docker.sh`
+   as its user-data). Security group needs inbound SSH (22) and whatever `HOST_PORT` you deploy on.
+3. The Jenkins agent's Vault token/AppRole has `jenkins-ec2-agents-policy.hcl` from
+   `../agent-keys` applied, so it can read `secret/ec2-agents/<date_name>`.
+4. The `docker deployment` agent from `project-8/jenkins-api-server-agent` — it already has
+   Docker, SSH and the `vault` CLI available.
 
-## Bootstrap the host (one-time)
+## Bootstrap (one-time)
 
 ```bash
+# 1. generate + register + store the keypair
+../agent-keys/generate-and-store.sh web-host
+# -> 2026-09-17_web-host
+
+# 2. launch the host with that keypair
 export AMI_ID=ami-xxxxxxxx        # Amazon Linux 2023 for your region
-export KEY_NAME=my-keypair
+export KEY_NAME=2026-09-17_web-host
 export SECURITY_GROUP_ID=sg-xxxxxxxx
 export SUBNET_ID=subnet-xxxxxxxx
 ./bootstrap/provision-ec2.sh
@@ -34,8 +41,11 @@ Create a Jenkins pipeline job pointing at this `Jenkinsfile` and set:
 | `APP_DIR`         | `project-9/containers/go-app`     |
 | `IMAGE_NAME`       | `go-app`                          |
 | `SSH_TARGET`       | `ec2-user@203.0.113.10`           |
+| `DATE_NAME`        | `2026-09-17_web-host`             |
 | `CONTAINER_PORT`   | `8080`                            |
 | `HOST_PORT`        | `8080`                            |
 
-The pipeline builds `IMAGE_NAME:BUILD_NUMBER`, ships it, replaces any existing container with the
-same name, and polls `HEALTH_PATH` on the host until it responds (or fails after ~30s).
+The pipeline fetches the `DATE_NAME` keypair's private key from Vault (deleted again at the end
+of the run, in `post { always { ... } }`), builds `IMAGE_NAME:BUILD_NUMBER`, ships it over SSH,
+replaces any existing container with the same name, and polls `HEALTH_PATH` on the host until it
+responds (or fails after ~30s).

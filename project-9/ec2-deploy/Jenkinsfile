@@ -12,8 +12,8 @@ pipeline {
                description: 'Docker image / container name')
         string(name: 'SSH_TARGET', defaultValue: '',
                description: 'user@host of the target EC2 instance, e.g. ec2-user@1.2.3.4')
-        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'ec2-deploy-key',
-               description: 'Jenkins SSH credentials ID for the target EC2 instance')
+        string(name: 'DATE_NAME', defaultValue: '',
+               description: 'date_name of the keypair from ../agent-keys/generate-and-store.sh, e.g. 2026-09-17_web-host')
         string(name: 'CONTAINER_PORT', defaultValue: '3000',
                description: 'Port the app listens on inside the container')
         string(name: 'HOST_PORT', defaultValue: '3000',
@@ -37,29 +37,37 @@ pipeline {
             }
         }
 
+        stage('Fetch SSH key from Vault') {
+            // same idea as ecs-deploy pulling AWS creds from Vault: nothing long-lived
+            // sits in Jenkins, the agent fetches the ../agent-keys/generate-and-store.sh
+            // keypair for this host by date_name and deletes it again in post{}
+            steps {
+                sh """
+                    vault kv get -field=private_key secret/ec2-agents/${params.DATE_NAME} > agent_key
+                    chmod 600 agent_key
+                """
+            }
+        }
+
         stage('Ship image to EC2') {
             // no registry involved: build on the agent, stream the image straight to the host
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIALS_ID]) {
-                    sh """
-                        docker save ${IMAGE_TAG} | gzip | \
-                        ssh -o StrictHostKeyChecking=no ${params.SSH_TARGET} 'gunzip | docker load'
-                    """
-                }
+                sh """
+                    docker save ${IMAGE_TAG} | gzip | \
+                    ssh -i agent_key -o StrictHostKeyChecking=no ${params.SSH_TARGET} 'gunzip | docker load'
+                """
             }
         }
 
         stage('Deploy container') {
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIALS_ID]) {
-                    sh """
-                        ssh -o StrictHostKeyChecking=no ${params.SSH_TARGET} '
-                            docker rm -f ${params.IMAGE_NAME} 2>/dev/null || true
-                            docker run -d --name ${params.IMAGE_NAME} --restart unless-stopped \
-                                -p ${params.HOST_PORT}:${params.CONTAINER_PORT} ${IMAGE_TAG}
-                        '
-                    """
-                }
+                sh """
+                    ssh -i agent_key -o StrictHostKeyChecking=no ${params.SSH_TARGET} '
+                        docker rm -f ${params.IMAGE_NAME} 2>/dev/null || true
+                        docker run -d --name ${params.IMAGE_NAME} --restart unless-stopped \
+                            -p ${params.HOST_PORT}:${params.CONTAINER_PORT} ${IMAGE_TAG}
+                    '
+                """
             }
         }
 
@@ -79,6 +87,12 @@ pipeline {
                     exit 1
                 """
             }
+        }
+    }
+
+    post {
+        always {
+            sh 'rm -f agent_key'
         }
     }
 }
