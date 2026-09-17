@@ -1,0 +1,84 @@
+pipeline {
+    agent { label 'docker deployment' }
+
+    options {
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'APP_DIR', defaultValue: 'project-9/containers/node-app',
+               description: 'Path (from repo root) to the app to build & deploy')
+        string(name: 'IMAGE_NAME', defaultValue: 'node-app',
+               description: 'Docker image / container name')
+        string(name: 'SSH_TARGET', defaultValue: '',
+               description: 'user@host of the target EC2 instance, e.g. ec2-user@1.2.3.4')
+        string(name: 'SSH_CREDENTIALS_ID', defaultValue: 'ec2-deploy-key',
+               description: 'Jenkins SSH credentials ID for the target EC2 instance')
+        string(name: 'CONTAINER_PORT', defaultValue: '3000',
+               description: 'Port the app listens on inside the container')
+        string(name: 'HOST_PORT', defaultValue: '3000',
+               description: 'Port to publish on the EC2 host')
+        string(name: 'HEALTH_PATH', defaultValue: '/health',
+               description: 'HTTP path used for the post-deploy health check')
+    }
+
+    environment {
+        IMAGE_TAG = "${params.IMAGE_NAME}:${env.BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Build image') {
+            steps {
+                sh "docker build -t ${IMAGE_TAG} ${params.APP_DIR}"
+            }
+        }
+
+        stage('Ship image to EC2') {
+            // no registry involved: build on the agent, stream the image straight to the host
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIALS_ID]) {
+                    sh """
+                        docker save ${IMAGE_TAG} | gzip | \
+                        ssh -o StrictHostKeyChecking=no ${params.SSH_TARGET} 'gunzip | docker load'
+                    """
+                }
+            }
+        }
+
+        stage('Deploy container') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIALS_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${params.SSH_TARGET} '
+                            docker rm -f ${params.IMAGE_NAME} 2>/dev/null || true
+                            docker run -d --name ${params.IMAGE_NAME} --restart unless-stopped \
+                                -p ${params.HOST_PORT}:${params.CONTAINER_PORT} ${IMAGE_TAG}
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Health check') {
+            steps {
+                sh """
+                    HOST=\$(echo '${params.SSH_TARGET}' | cut -d'@' -f2)
+                    for i in \$(seq 1 10); do
+                        if curl -fsS "http://\$HOST:${params.HOST_PORT}${params.HEALTH_PATH}"; then
+                            echo
+                            echo "${params.IMAGE_NAME} is healthy on \$HOST:${params.HOST_PORT}"
+                            exit 0
+                        fi
+                        sleep 3
+                    done
+                    echo "${params.IMAGE_NAME} failed health check after deploy" >&2
+                    exit 1
+                """
+            }
+        }
+    }
+}

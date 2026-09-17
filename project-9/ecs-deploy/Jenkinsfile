@@ -1,0 +1,112 @@
+pipeline {
+    agent { label 'docker deployment' }
+
+    options {
+        timestamps()
+    }
+
+    parameters {
+        string(name: 'APP_DIR', defaultValue: 'project-9/containers/python-app',
+               description: 'Path (from repo root) to the app to build & deploy')
+        string(name: 'ECR_REPO', defaultValue: '',
+               description: 'Full ECR repo URI, e.g. 123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/python-app')
+        string(name: 'AWS_REGION', defaultValue: 'ap-northeast-1')
+        string(name: 'ECS_CLUSTER', defaultValue: 'cd-stack-cluster')
+        string(name: 'ECS_SERVICE', defaultValue: 'python-app-service')
+        string(name: 'TASK_FAMILY', defaultValue: 'python-app')
+        string(name: 'CONTAINER_NAME', defaultValue: 'python-app')
+        string(name: 'CONTAINER_PORT', defaultValue: '5000')
+        string(name: 'EXECUTION_ROLE_ARN', defaultValue: '',
+               description: 'ARN of the ecsTaskExecutionRole')
+    }
+
+    environment {
+        IMAGE_TAG = "${params.ECR_REPO}:${env.BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Fetch short-lived AWS creds from Vault') {
+            // same flow as project-8/aws-perm-generator/assume_role_vault.sh:
+            // Vault mints temporary STS creds for the jenkins-role, nothing long-lived on the agent
+            steps {
+                sh '''
+                    CREDS=$(vault read -format=json aws/creds/jenkins)
+                    {
+                        echo "export AWS_ACCESS_KEY_ID=$(printf '%s\\n' "$CREDS" | awk -F'"' '/"access_key"/ {print $4}')"
+                        echo "export AWS_SECRET_ACCESS_KEY=$(printf '%s\\n' "$CREDS" | awk -F'"' '/"secret_key"/ {print $4}')"
+                        echo "export AWS_SESSION_TOKEN=$(printf '%s\\n' "$CREDS" | awk -F'"' '/"security_token"/ {print $4}')"
+                    } > aws.env
+                '''
+            }
+        }
+
+        stage('Build & push image to ECR') {
+            steps {
+                sh """
+                    . ./aws.env
+                    aws ecr get-login-password --region ${params.AWS_REGION} | \
+                        docker login --username AWS --password-stdin \$(echo ${params.ECR_REPO} | cut -d'/' -f1)
+                    docker build -t ${IMAGE_TAG} ${params.APP_DIR}
+                    docker push ${IMAGE_TAG}
+                """
+            }
+        }
+
+        stage('Register task definition') {
+            steps {
+                sh """
+                    export IMAGE="${IMAGE_TAG}"
+                    export CONTAINER_NAME="${params.CONTAINER_NAME}"
+                    export CONTAINER_PORT="${params.CONTAINER_PORT}"
+                    export TASK_FAMILY="${params.TASK_FAMILY}"
+                    export AWS_REGION="${params.AWS_REGION}"
+                    export EXECUTION_ROLE_ARN="${params.EXECUTION_ROLE_ARN}"
+                    envsubst < project-9/ecs-deploy/task-def.json.template > task-def.rendered.json
+
+                    . ./aws.env
+                    TASK_DEF_ARN=\$(aws ecs register-task-definition \
+                        --region ${params.AWS_REGION} \
+                        --cli-input-json file://task-def.rendered.json \
+                        --query 'taskDefinition.taskDefinitionArn' --output text)
+                    echo "\$TASK_DEF_ARN" > task-def-arn.txt
+                """
+            }
+        }
+
+        stage('Update ECS service') {
+            steps {
+                sh """
+                    . ./aws.env
+                    aws ecs update-service \
+                        --region ${params.AWS_REGION} \
+                        --cluster ${params.ECS_CLUSTER} \
+                        --service ${params.ECS_SERVICE} \
+                        --task-definition "\$(cat task-def-arn.txt)" \
+                        --force-new-deployment
+                """
+            }
+        }
+
+        stage('Wait for service to stabilize') {
+            steps {
+                sh """
+                    . ./aws.env
+                    aws ecs wait services-stable \
+                        --region ${params.AWS_REGION} \
+                        --cluster ${params.ECS_CLUSTER} \
+                        --services ${params.ECS_SERVICE}
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'rm -f aws.env task-def.rendered.json task-def-arn.txt'
+        }
+    }
+}

@@ -1,0 +1,9 @@
+services:
+  status-notifier:
+    build: .
+    container_name: status-notifier
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./config/services.yml:/app/config/services.yml:ro
