@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # Provisions a full VPC network end to end: VPC + Internet Gateway, 2 public + 2 private
-# subnets across 2 AZs, a NAT Gateway for the private subnets, and the route tables that
-# wire it all together. Writes every resource ID to state/<name>.env so other scripts
-# (../security-groups, ../../project-9/ec2-deploy) can source it instead of copy-pasting IDs.
+# subnets across 2 AZs, and the route tables that wire it together. Writes every resource ID
+# to state/<name>.env so other scripts (../security-groups, ../../project-9/ec2-deploy) can
+# source it instead of copy-pasting IDs.
 #
-# This sets up exactly one NAT Gateway (in the first public subnet) for cost/simplicity in a
-# learning setup - a real HA design puts one NAT Gateway per AZ so a single AZ outage can't
-# take outbound access from every private subnet with it. See README.md.
+# No NAT Gateway - private subnets have no outbound internet route, only the private route
+# table so they're ready for one later. See README.md.
 #
 # Usage: ./provision-all.sh <name> [cidr]   (cidr defaults to 10.0.0.0/16)
 set -euo pipefail
@@ -31,11 +30,8 @@ eval "$("$SCRIPT_DIR/provision-subnets.sh" "$NAME" "$VPC_ID")"
 read -ra PUBLIC_SUBNET_ARR <<< "$PUBLIC_SUBNET_IDS"
 read -ra PRIVATE_SUBNET_ARR <<< "$PRIVATE_SUBNET_IDS"
 
-echo "== nat gateway (in ${PUBLIC_SUBNET_ARR[0]}) =="
-eval "$("$SCRIPT_DIR/provision-nat-gateway.sh" "$NAME" "${PUBLIC_SUBNET_ARR[0]}")"
-
 echo "== route tables =="
-eval "$("$SCRIPT_DIR/provision-route-tables.sh" "$NAME" "$VPC_ID" "$IGW_ID" "$NAT_GW_ID" \
+eval "$("$SCRIPT_DIR/provision-route-tables.sh" "$NAME" "$VPC_ID" "$IGW_ID" \
     "${PUBLIC_SUBNET_ARR[@]}" -- "${PRIVATE_SUBNET_ARR[@]}")"
 
 {
@@ -43,8 +39,6 @@ eval "$("$SCRIPT_DIR/provision-route-tables.sh" "$NAME" "$VPC_ID" "$IGW_ID" "$NA
     echo "IGW_ID=$IGW_ID"
     echo "PUBLIC_SUBNET_IDS=\"$PUBLIC_SUBNET_IDS\""
     echo "PRIVATE_SUBNET_IDS=\"$PRIVATE_SUBNET_IDS\""
-    echo "NAT_GW_ID=$NAT_GW_ID"
-    echo "EIP_ALLOC_ID=$EIP_ALLOC_ID"
     echo "PUBLIC_RT_ID=$PUBLIC_RT_ID"
     echo "PRIVATE_RT_ID=$PRIVATE_RT_ID"
 } > "$STATE_FILE"

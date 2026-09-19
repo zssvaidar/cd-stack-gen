@@ -18,16 +18,23 @@ and hands off VPC + subnet IDs to the rest of this stack.
  10.0.0.0/24, 10.0.1.0/24   10.0.10.0/24, 10.0.11.0/24
  az-a         az-c          az-a          az-c
    |                             |
- route: 0.0.0.0/0 -> igw     route: 0.0.0.0/0 -> nat gateway
-                                              (nat lives in a public subnet)
+ route: 0.0.0.0/0 -> igw     (no default route - isolated)
 ```
 
 - **Public subnets**: bastion + app tier go here (matches `../security-groups`'s
   `*-bastion-sg` / `*-app-sg`). Instances get a public IP on launch and route straight out
   through the Internet Gateway.
-- **Private subnets**: the db tier goes here (matches `*-db-sg`). No public IP, no inbound
-  route from the internet at all - outbound (for patching) goes through the NAT Gateway.
+- **Private subnets**: the db tier goes here (matches `*-db-sg`). No public IP, and — for
+  now — no outbound internet route either: no NAT Gateway in this project, so the private
+  route table has no `0.0.0.0/0` route at all. That's a deliberate cost/complexity tradeoff
+  for a learning setup, not a security best practice being skipped; see the note below.
 - Two AZs, because a "highly available" subnet layout in a single AZ isn't one.
+
+**No NAT means fully isolated, not just "no inbound."** `../security-groups/provision-3tier.sh`
+gives the db tier an egress rule for HTTPS (OS/package patching) — with no NAT Gateway, that
+rule has nowhere to route to, so patching-over-the-internet from the db tier won't work until
+one exists. Add a NAT Gateway (`aws ec2 create-nat-gateway` in a public subnet, plus a
+`0.0.0.0/0` route on `$PRIVATE_RT_ID` pointing at it) when that's actually needed.
 
 ## Best practices
 
@@ -47,20 +54,17 @@ and hands off VPC + subnet IDs to the rest of this stack.
    That flag only decides whether a new instance *gets* a public IP; without a `0.0.0.0/0 ->
    igw` route in its subnet's route table, that IP goes nowhere. Both pieces have to agree
    (`provision-subnets.sh` sets the flag, `provision-route-tables.sh` sets the route).
-6. **One NAT Gateway per AZ for real HA.** `provision-all.sh` here creates exactly one, in the
-   first public subnet, to keep a learning setup cheap and simple — that's a single point of
-   failure and a deliberate shortcut, not a production pattern. Scale it to one per AZ (each
-   private subnet's route table pointing at the NAT Gateway in its *own* AZ) before this backs
-   anything real.
-7. **NAT Gateways cost money while idle** (hourly + per-GB). Run `teardown.sh` when you're
-   done experimenting instead of leaving one running.
-8. **Tag everything at creation** (every script here tags `Name` + `project`, same convention
+6. **Tag everything at creation** (every script here tags `Name` + `project`, same convention
    as `../security-groups`). An unlabeled VPC full of unlabeled subnets is unauditable within
    a month.
-9. **For anything past a learning setup, turn on VPC Flow Logs** (`aws ec2
+7. **For anything past a learning setup, turn on VPC Flow Logs** (`aws ec2
    create-flow-logs --resource-type VPC ... --log-destination-type cloud-watch-logs`) so
    traffic is auditable after the fact. Not wired up here to keep this focused, but it's the
    natural next thing to add on top of this VPC.
+8. **When you do add a NAT Gateway later, plan for one per AZ.** A single NAT Gateway is a
+   single point of failure for every private subnet's outbound access, and it bills hourly
+   plus per-GB even sitting idle — don't provision one before something actually needs
+   outbound access from a private subnet.
 
 ## Usage
 
@@ -80,10 +84,9 @@ account-specific infrastructure state, not something to commit). Source it to ge
 set -a; source state/myapp.env; set +a
 ```
 
-Individual steps (`provision-vpc.sh`, `provision-subnets.sh`, `provision-nat-gateway.sh`,
-`provision-route-tables.sh`) are also runnable on their own — each prints its own `KEY=value`
-lines on stdout so they chain with `eval "$(...)"`, same pattern as `provision-all.sh` uses
-internally.
+Individual steps (`provision-vpc.sh`, `provision-subnets.sh`, `provision-route-tables.sh`)
+are also runnable on their own — each prints its own `KEY=value` lines on stdout so they
+chain with `eval "$(...)"`, same pattern as `provision-all.sh` uses internally.
 
 ## Wiring into the rest of this stack
 

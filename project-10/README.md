@@ -11,8 +11,9 @@ nothing).
 ## Layout
 
 - **[`vpc-network/`](vpc-network/)** — a public/private VPC across two AZs: public subnets
-  (bastion, app tier) routed through an Internet Gateway, private subnets (db tier) routed
-  through a NAT Gateway. Provision it first — everything else in this project lives inside it.
+  (bastion, app tier) routed through an Internet Gateway, private subnets (db tier) with no
+  outbound route for now (no NAT Gateway yet — see its README for the tradeoff). Provision it
+  first — everything else in this project lives inside it.
 - **[`security-groups/`](security-groups/)** — least-privilege security groups on top of that
   VPC: SG-to-SG references across a bastion → app → db tier, attach/detach helpers, and an
   audit script.

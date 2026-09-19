@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Prints a human-readable summary of a network provisioned by provision-all.sh: the VPC,
-# its subnets (with public/private tier and AZ), route tables, and NAT gateway state.
-# Read-only.
+# its subnets (with public/private tier and AZ), and route tables. Read-only.
 #
 # Usage: ./show-network.sh <name>
 set -euo pipefail
@@ -27,7 +26,3 @@ echo "== route tables =="
 aws ec2 describe-route-tables --region "$AWS_REGION" --filters "Name=vpc-id,Values=$VPC_ID" \
     --query 'RouteTables[].{Id:RouteTableId,Routes:Routes[].DestinationCidrBlock,Associations:Associations[].SubnetId}' \
     --output table
-
-echo "== nat gateway $NAT_GW_ID =="
-aws ec2 describe-nat-gateways --region "$AWS_REGION" --nat-gateway-ids "$NAT_GW_ID" \
-    --query 'NatGateways[0].{State:State,SubnetId:SubnetId}' --output table

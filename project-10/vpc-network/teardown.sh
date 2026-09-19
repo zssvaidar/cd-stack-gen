@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Tears down everything provision-all.sh created, in the order AWS requires: NAT gateway
-# first (and its EIP), then route table associations, then subnets, then the Internet
-# Gateway, then the VPC itself. A NAT Gateway bills by the hour even sitting idle - don't
-# leave one behind in a learning account.
+# Tears down everything provision-all.sh created, in the order AWS requires: route table
+# associations first, then subnets, then the Internet Gateway, then the VPC itself.
 #
 # If anything is still using this VPC (running instances, security groups other than the
 # default one, ENIs) the subnet/VPC deletion steps will fail with AWS's own error - delete
@@ -19,13 +17,6 @@ STATE_FILE="$SCRIPT_DIR/state/${NAME}.env"
 set -a; source "$STATE_FILE"; set +a
 
 AWS_REGION="${AWS_REGION:-ap-northeast-1}"
-
-echo "deleting nat gateway $NAT_GW_ID"
-aws ec2 delete-nat-gateway --region "$AWS_REGION" --nat-gateway-id "$NAT_GW_ID"
-aws ec2 wait nat-gateway-deleted --region "$AWS_REGION" --nat-gateway-ids "$NAT_GW_ID"
-
-echo "releasing eip $EIP_ALLOC_ID"
-aws ec2 release-address --region "$AWS_REGION" --allocation-id "$EIP_ALLOC_ID"
 
 for RT_ID in "$PUBLIC_RT_ID" "$PRIVATE_RT_ID"; do
     ASSOC_IDS=$(aws ec2 describe-route-tables --region "$AWS_REGION" --route-table-ids "$RT_ID" \
