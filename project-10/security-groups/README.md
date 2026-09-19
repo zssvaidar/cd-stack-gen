@@ -59,6 +59,9 @@ deliberately instead of by editing a giant shared group everyone's afraid to tou
 
 ## Reference architecture: bastion → app → db
 
+Needs a VPC first — see `../vpc-network` if you don't have one (`provision-all.sh <name>`
+gives you a `VPC_ID` plus public/private subnets sized for exactly this bastion/app/db split).
+
 `provision-3tier.sh` builds this from scratch:
 
 | security group | inbound                                              | outbound                          |
