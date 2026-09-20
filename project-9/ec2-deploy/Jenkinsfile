@@ -20,6 +20,10 @@ pipeline {
                description: 'Port to publish on the EC2 host')
         string(name: 'HEALTH_PATH', defaultValue: '/health',
                description: 'HTTP path used for the post-deploy health check')
+        string(name: 'DATA_DIR', defaultValue: '',
+               description: 'Path inside the container where the app keeps persistent data (e.g. /data). Leave blank if none.')
+        string(name: 'LOG_DIR', defaultValue: '',
+               description: 'Path inside the container where the app writes log files (e.g. /var/log/app). Leave blank if none.')
     }
 
     environment {
@@ -60,12 +64,26 @@ pipeline {
         }
 
         stage('Deploy container') {
+            // Data/logs live on the host under /opt/<IMAGE_NAME>/{data,logs}, bind-mounted into
+            // the container. `docker rm -f` only removes the container, never the host directory,
+            // so a version update (new image, same mounts) keeps everything that was written there.
             steps {
+                script {
+                    def volumeFlags = ''
+                    if (params.DATA_DIR?.trim()) {
+                        volumeFlags += " -v /opt/${params.IMAGE_NAME}/data:${params.DATA_DIR}"
+                    }
+                    if (params.LOG_DIR?.trim()) {
+                        volumeFlags += " -v /opt/${params.IMAGE_NAME}/logs:${params.LOG_DIR}"
+                    }
+                    env.VOLUME_FLAGS = volumeFlags
+                }
                 sh """
                     ssh -i agent_key -o StrictHostKeyChecking=no ${params.SSH_TARGET} '
+                        mkdir -p /opt/${params.IMAGE_NAME}/data /opt/${params.IMAGE_NAME}/logs
                         docker rm -f ${params.IMAGE_NAME} 2>/dev/null || true
                         docker run -d --name ${params.IMAGE_NAME} --restart unless-stopped \
-                            -p ${params.HOST_PORT}:${params.CONTAINER_PORT} ${IMAGE_TAG}
+                            -p ${params.HOST_PORT}:${params.CONTAINER_PORT}${VOLUME_FLAGS} ${IMAGE_TAG}
                     '
                 """
             }
