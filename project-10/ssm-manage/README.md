@@ -2,8 +2,9 @@
 
 `create`/`destroy` orchestrator (same single-file, tag-driven pattern as the rest of
 `project-10`) that sets an EC2 instance up to be managed through AWS Systems Manager Session
-Manager instead of SSH: an IAM role + instance profile, and the three VPC interface endpoints
-that let an instance reach SSM without a route to the internet at all.
+Manager instead of SSH: an IAM role + instance profile with `AmazonSSMManagedInstanceCore`
+attached. That's the whole thing — the SSM Agent on the instance calls out to the public SSM
+API over internet access the instance already has, so there's nothing VPC-shaped to create.
 
 ## Why this instead of (or alongside) `../security-groups`'s bastion
 
@@ -15,40 +16,30 @@ that let an instance reach SSM without a route to the internet at all.
 - **IAM controls access, not a shared key.** Who can `aws ssm start-session` is an IAM policy
   decision, tied to a real identity - not "whoever has a copy of the private key" the way
   `../../project-9/agent-keys` keys are.
-- **Works from a fully isolated private subnet.** `../vpc-network`'s private subnets have no
-  NAT Gateway and no route to the internet (see its README). SSH from outside is impossible
-  there by design. The VPC interface endpoints this script creates are how you'd still reach
-  an instance in that subnet - traffic to Session Manager never leaves the VPC.
 - **Every session is logged.** Unlike a bare SSH connection, Session Manager sessions are
   recorded in CloudTrail by default (and optionally streamed in full to CloudWatch Logs / S3 -
   not configured here, but the natural next step).
 
 ## What it creates
 
-| resource                                   | purpose                                              |
-|---------------------------------------------|--------------------------------------------------------|
-| IAM role `ssm-instance-role-$PURPOSE`       | trust policy for `ec2.amazonaws.com`, `AmazonSSMManagedInstanceCore` attached |
-| instance profile `ssm-instance-profile-$PURPOSE` | wraps the role - this is what actually attaches to an instance |
-| security group `ssm-endpoints-sg-$PURPOSE`  | allows 443 from the VPC's own CIDR into the endpoints  |
-| 3 interface VPC endpoints                   | `ssm`, `ssmmessages`, `ec2messages` - the minimum set for Session Manager to work, private DNS enabled |
+| resource                                          | purpose                                          |
+|-----------------------------------------------------|-----------------------------------------------------|
+| IAM role `ssm-instance-role-$PURPOSE`               | trust policy for `ec2.amazonaws.com`, `AmazonSSMManagedInstanceCore` attached |
+| instance profile `ssm-instance-profile-$PURPOSE`    | wraps the role - this is what actually attaches to an instance |
 
 ## Usage
 
-Needs a VPC + subnet(s) already tagged `Purpose=<value>` — from your own VPC/subnet
-provisioning, tagged the same way this script discovers everything else.
-
 ```bash
 cp wrapper/config/.env.example wrapper/config/.env   # fill in the creator credentials, once
-export PURPOSE=testing                                # must match the VPC/subnets' Purpose tag
+export PURPOSE=testing
 
 ./ssm-manage.sh create
 ./ssm-manage.sh destroy
 ```
 
-State (VPC ID, role/profile names, security group ID, endpoint IDs) is written to
-`state/$PURPOSE.env` (gitignored) purely for your own reference — `destroy` doesn't read it
-back; like the rest of this pattern, it rediscovers everything by the `Purpose` tag, so it's
-safe to run even if the state file was lost.
+State (role/profile names) is written to `state/$PURPOSE.env` (gitignored) purely for your own
+reference — `destroy` doesn't read it back; it rediscovers the role/profile by their
+deterministic `$PURPOSE`-based name, so it's safe to run even if the state file was lost.
 
 Once an instance has the instance profile and the SSM Agent (preinstalled on current Amazon
 Linux / Ubuntu AMIs), connect with:
@@ -57,14 +48,20 @@ Linux / Ubuntu AMIs), connect with:
 aws ssm start-session --target i-0123456789abcdef0
 ```
 
+## If an instance ever doesn't have internet access
+
+This assumes the instance can reach `ssm.<region>.amazonaws.com` etc. directly - true for
+anything in a public subnet, or a private subnet with a NAT Gateway. If that stops being true
+(e.g. a private subnet in `../vpc-network`, which has no NAT Gateway by design), the instance
+needs three VPC interface endpoints instead - `ssm`, `ssmmessages`, `ec2messages` - plus a
+security group allowing 443 into them from the VPC's CIDR. Not built here since it's not
+needed for the current setup; ask for it if that changes.
+
 ## Gotchas
 
-- **Instance profile propagation.** IAM is eventually consistent; `create` sleeps 10s after
-  creating the instance profile before printing the summary, since launching an instance
-  against a profile that isn't visible yet fails intermittently.
-- **IAM has no `--region`.** Roles and instance profiles are global; only the EC2/VPC calls in
-  this script take `--region`.
-- **`destroy` is idempotent by design**, same as `../vpc-network/teardown.sh`'s and
-  `../security-groups`'s scripts: it looks resources up by the `Purpose` tag (or, for the IAM
-  role/profile, by their deterministic name) rather than assuming a fixed set exists, so
-  re-running it after a partial failure is safe.
+- **Instance profile propagation.** IAM is eventually consistent - if launching or associating
+  an instance against a just-created profile fails right away, wait a few seconds and retry.
+- **IAM has no `--region`.** Roles and instance profiles are global.
+- **`destroy` is idempotent by design**, same as the rest of `project-10`: it checks whether
+  the role/profile exist before touching them, so re-running it after a partial failure is
+  safe.

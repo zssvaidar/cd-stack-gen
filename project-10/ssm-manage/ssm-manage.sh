@@ -17,22 +17,13 @@ STATE_FILE=state/$Purpose.env
 POLICY_ARN="arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 ROLE_NAME="ssm-instance-role-$Purpose"
 INSTANCE_PROFILE_NAME="ssm-instance-profile-$Purpose"
-ENDPOINT_SG_NAME="ssm-endpoints-sg-$Purpose"
 
 statefile() {
     cat > "$STATE_FILE" <<EOF
 export AWS_REGION="$AWS_REGION"
 
-export VPC_ID="$VPC_ID"
-
 export ROLE_NAME="$ROLE_NAME"
 export INSTANCE_PROFILE_NAME="$INSTANCE_PROFILE_NAME"
-
-export ENDPOINT_SG="$ENDPOINT_SG"
-
-export SSM_ENDPOINT_ID="$SSM_ENDPOINT_ID"
-export SSMMESSAGES_ENDPOINT_ID="$SSMMESSAGES_ENDPOINT_ID"
-export EC2MESSAGES_ENDPOINT_ID="$EC2MESSAGES_ENDPOINT_ID"
 EOF
 
     echo "State saved to $STATE_FILE"
@@ -40,43 +31,13 @@ EOF
 
 
 create() {
-    echo "=== Looking up VPC + subnets tagged Purpose=$Purpose ==="
-
-    VPC_ID=$(aws ec2 describe-vpcs \
-        --region "$AWS_REGION" \
-        --filters "Name=tag:Purpose,Values=$Purpose" \
-        --query 'Vpcs[0].VpcId' \
-        --output text)
-
-    if [ "$VPC_ID" == "None" ] || [ -z "$VPC_ID" ]; then
-        echo "no vpc tagged Purpose=$Purpose - provision the network first" >&2
-        exit 1
-    fi
-
-    VPC_CIDR=$(aws ec2 describe-vpcs \
-        --region "$AWS_REGION" \
-        --vpc-ids "$VPC_ID" \
-        --query 'Vpcs[0].CidrBlock' \
-        --output text)
-
-    SUBNET_IDS=$(aws ec2 describe-subnets \
-        --region "$AWS_REGION" \
-        --filters "Name=tag:Purpose,Values=$Purpose" \
-        --query 'Subnets[*].SubnetId' \
-        --output text)
-
-    if [ -z "$SUBNET_IDS" ]; then
-        echo "no subnets tagged Purpose=$Purpose - provision the network first" >&2
-        exit 1
-    fi
-
-    echo "VPC:     $VPC_ID ($VPC_CIDR)"
-    echo "Subnets: $SUBNET_IDS"
-
-
     # --------------------------------------------------
     # IAM role + instance profile
     # --------------------------------------------------
+    # this is the only thing SSM actually needs: the instance calls out to the public SSM
+    # API over the internet access it already has, so there's no VPC endpoint or security
+    # group to create here - see README.md if that ever changes (a private/no-internet
+    # subnet needs VPC interface endpoints instead).
 
     echo "=== Creating IAM role ==="
 
@@ -104,88 +65,6 @@ create() {
     echo "Role:             $ROLE_NAME"
     echo "Instance profile: $INSTANCE_PROFILE_NAME"
 
-    # a fresh instance profile isn't usable by ec2 the instant iam returns it - it needs a
-    # few seconds to propagate, or launching/associating against it fails intermittently
-    echo "waiting for instance profile to propagate..."
-    sleep 10
-
-
-    # --------------------------------------------------
-    # Security group for the interface endpoints
-    # --------------------------------------------------
-
-    echo "=== Creating endpoint security group ==="
-
-    ENDPOINT_SG=$(aws ec2 create-security-group \
-        --region "$AWS_REGION" \
-        --group-name "$ENDPOINT_SG_NAME" \
-        --description "HTTPS from the VPC to SSM interface endpoints" \
-        --vpc-id "$VPC_ID" \
-        --tag-specifications \
-        "ResourceType=security-group,Tags=[{Key=Purpose,Value=$Purpose}]" \
-        --query 'GroupId' \
-        --output text)
-
-    aws ec2 authorize-security-group-ingress \
-        --region "$AWS_REGION" \
-        --group-id "$ENDPOINT_SG" \
-        --ip-permissions "IpProtocol=tcp,FromPort=443,ToPort=443,IpRanges=[{CidrIp=$VPC_CIDR,Description=\"vpc -> ssm endpoints\"}]"
-
-    echo "Endpoint SG: $ENDPOINT_SG"
-
-
-    # --------------------------------------------------
-    # Interface endpoints: ssm, ssmmessages, ec2messages
-    # --------------------------------------------------
-    # these three are what let an instance reach Session Manager without any inbound rule
-    # on its own security group, and without a route to the internet at all - handy for a
-    # private subnet with no NAT gateway.
-
-    echo "=== Creating VPC endpoints ==="
-
-    SSM_ENDPOINT_ID=$(aws ec2 create-vpc-endpoint \
-        --region "$AWS_REGION" \
-        --vpc-id "$VPC_ID" \
-        --service-name "com.amazonaws.$AWS_REGION.ssm" \
-        --vpc-endpoint-type Interface \
-        --subnet-ids $SUBNET_IDS \
-        --security-group-ids "$ENDPOINT_SG" \
-        --private-dns-enabled \
-        --tag-specifications \
-        "ResourceType=vpc-endpoint,Tags=[{Key=Purpose,Value=$Purpose}]" \
-        --query 'VpcEndpoint.VpcEndpointId' \
-        --output text)
-
-    SSMMESSAGES_ENDPOINT_ID=$(aws ec2 create-vpc-endpoint \
-        --region "$AWS_REGION" \
-        --vpc-id "$VPC_ID" \
-        --service-name "com.amazonaws.$AWS_REGION.ssmmessages" \
-        --vpc-endpoint-type Interface \
-        --subnet-ids $SUBNET_IDS \
-        --security-group-ids "$ENDPOINT_SG" \
-        --private-dns-enabled \
-        --tag-specifications \
-        "ResourceType=vpc-endpoint,Tags=[{Key=Purpose,Value=$Purpose}]" \
-        --query 'VpcEndpoint.VpcEndpointId' \
-        --output text)
-
-    EC2MESSAGES_ENDPOINT_ID=$(aws ec2 create-vpc-endpoint \
-        --region "$AWS_REGION" \
-        --vpc-id "$VPC_ID" \
-        --service-name "com.amazonaws.$AWS_REGION.ec2messages" \
-        --vpc-endpoint-type Interface \
-        --subnet-ids $SUBNET_IDS \
-        --security-group-ids "$ENDPOINT_SG" \
-        --private-dns-enabled \
-        --tag-specifications \
-        "ResourceType=vpc-endpoint,Tags=[{Key=Purpose,Value=$Purpose}]" \
-        --query 'VpcEndpoint.VpcEndpointId' \
-        --output text)
-
-    echo "ssm endpoint:         $SSM_ENDPOINT_ID"
-    echo "ssmmessages endpoint: $SSMMESSAGES_ENDPOINT_ID"
-    echo "ec2messages endpoint: $EC2MESSAGES_ENDPOINT_ID"
-
 
     # --------------------------------------------------
     # Summary
@@ -195,14 +74,12 @@ create() {
     echo "========================================"
     echo "SSM management ready"
     echo "========================================"
-    echo "VPC:                  $VPC_ID"
-    echo "IAM role:              $ROLE_NAME"
-    echo "Instance profile:      $INSTANCE_PROFILE_NAME"
-    echo "Endpoint SG:           $ENDPOINT_SG"
-    echo "ssm endpoint:          $SSM_ENDPOINT_ID"
-    echo "ssmmessages endpoint:  $SSMMESSAGES_ENDPOINT_ID"
-    echo "ec2messages endpoint:  $EC2MESSAGES_ENDPOINT_ID"
+    echo "IAM role:          $ROLE_NAME"
+    echo "Instance profile:  $INSTANCE_PROFILE_NAME"
     echo "========================================"
+    echo
+    echo "note: a fresh instance profile can take a few seconds to propagate - if launching"
+    echo "or associating against it fails right away, wait a moment and retry."
     echo
     echo "launch an instance with:  --iam-instance-profile Name=$INSTANCE_PROFILE_NAME"
     echo "attach to a running one:  aws ec2 associate-iam-instance-profile --instance-id <id> --iam-instance-profile Name=$INSTANCE_PROFILE_NAME"
@@ -214,48 +91,6 @@ create() {
 
 destroy() {
     echo "=== Finding resources tagged Purpose=$Purpose ==="
-
-    # --------------------------------------------------
-    # VPC endpoints
-    # --------------------------------------------------
-
-    ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
-        --region "$AWS_REGION" \
-        --filters "Name=tag:Purpose,Values=$Purpose" "Name=vpc-endpoint-state,Values=available,pending" \
-        --query 'VpcEndpoints[*].VpcEndpointId' \
-        --output text)
-
-    if [ -n "$ENDPOINT_IDS" ]; then
-        echo "Deleting vpc endpoints: $ENDPOINT_IDS"
-
-        aws ec2 delete-vpc-endpoints \
-            --region "$AWS_REGION" \
-            --vpc-endpoint-ids $ENDPOINT_IDS
-
-        echo "waiting for endpoints to finish deleting..."
-        aws ec2 wait vpc-endpoint-deleted \
-            --region "$AWS_REGION" \
-            --vpc-endpoint-ids $ENDPOINT_IDS
-    fi
-
-
-    # --------------------------------------------------
-    # Endpoint security group
-    # --------------------------------------------------
-
-    for sg in $(aws ec2 describe-security-groups \
-        --region "$AWS_REGION" \
-        --filters "Name=tag:Purpose,Values=$Purpose" "Name=group-name,Values=$ENDPOINT_SG_NAME" \
-        --query 'SecurityGroups[*].GroupId' \
-        --output text); do
-
-        echo "Deleting security group: $sg"
-
-        aws ec2 delete-security-group \
-            --region "$AWS_REGION" \
-            --group-id "$sg"
-    done
-
 
     # --------------------------------------------------
     # Instance profile (iam is global - no --region)
