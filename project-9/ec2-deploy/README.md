@@ -44,8 +44,24 @@ Create a Jenkins pipeline job pointing at this `Jenkinsfile` and set:
 | `DATE_NAME`        | `2026-09-17_web-host`             |
 | `CONTAINER_PORT`   | `8080`                            |
 | `HOST_PORT`        | `8080`                            |
+| `DATA_DIR`         | `/data` (optional)                |
+| `LOG_DIR`          | `/var/log/app` (optional)         |
 
 The pipeline fetches the `DATE_NAME` keypair's private key from Vault (deleted again at the end
 of the run, in `post { always { ... } }`), builds `IMAGE_NAME:BUILD_NUMBER`, ships it over SSH,
 replaces any existing container with the same name, and polls `HEALTH_PATH` on the host until it
 responds (or fails after ~30s).
+
+## Persisting data and logs across updates
+
+`docker rm -f` (run before every deploy, to replace the old container with the new image) only
+removes the container — it never touches the host filesystem. If your app writes anything under
+`DATA_DIR` / `LOG_DIR` inside the container, set those parameters and the pipeline bind-mounts
+`/opt/<IMAGE_NAME>/data` and `/opt/<IMAGE_NAME>/logs` on the EC2 host into the same paths in the
+new container, so a version update keeps everything that was written there. Leave a parameter
+blank to skip its mount (e.g. a stateless app with no `DATA_DIR`).
+
+This protects you against redeploys and container crashes/restarts, not against losing the EC2
+instance itself — for durability across an instance replacement, ship logs to a central collector
+(e.g. Loki) and back real data with something outside the instance (EBS snapshot, S3, RDS, etc.)
+rather than relying solely on the host's local disk.
