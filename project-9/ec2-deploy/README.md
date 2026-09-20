@@ -6,9 +6,9 @@ SSH (`docker save | ssh | docker load`), runs it, and health-checks it.
 
 ## Prerequisites
 
-1. A keypair from `../agent-keys/generate-and-store.sh <name>` — it prints a `date_name`
-   (e.g. `2026-09-17_web-host`), imports the public key into AWS, and stores both halves in
-   Vault. See `../agent-keys/README.md`.
+1. A keypair from `../agent-keys/generate-and-store.sh create <name>` — it prints a
+   `date_name` (e.g. `2026-09-17_web-host`), imports the public key into AWS, and stores both
+   halves in Vault. See `../agent-keys/README.md`.
 2. An EC2 host launched with that keypair and Docker installed, reachable over SSH from the
    Jenkins agent (`bootstrap/provision-ec2.sh` launches one, with `bootstrap/cloud-init-docker.sh`
    as its user-data). Security group needs inbound SSH (22) and whatever `HOST_PORT` you deploy on.
@@ -21,7 +21,7 @@ SSH (`docker save | ssh | docker load`), runs it, and health-checks it.
 
 ```bash
 # 1. generate + register + store the keypair
-../agent-keys/generate-and-store.sh web-host
+../agent-keys/generate-and-store.sh create web-host
 # -> 2026-09-17_web-host
 
 # 2. launch the host with that keypair

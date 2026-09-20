@@ -30,7 +30,7 @@ Continuation of the CD stack from
 
 ## How it fits together
 
-1. For EC2, generate a keypair first: `agent-keys/generate-and-store.sh <name>`.
+1. For EC2, generate a keypair first: `agent-keys/generate-and-store.sh create <name>`.
 2. Provision infra: `ec2-deploy/bootstrap/provision-ec2.sh` (using that keypair) and/or
    `ecs-deploy/bootstrap/create-cluster-and-service.sh`.
 3. Add the two Jenkinsfiles as pipeline jobs on the controller from

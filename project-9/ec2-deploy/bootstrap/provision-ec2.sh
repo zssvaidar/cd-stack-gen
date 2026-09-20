@@ -5,7 +5,7 @@
 # Required env vars:
 #   AMI_ID              e.g. an Amazon Linux 2023 AMI for your region
 #   KEY_NAME             an existing EC2 key pair - use the date_name printed by
-#                        ../../agent-keys/generate-and-store.sh, which already imported it
+#                        ../../agent-keys/generate-and-store.sh create, which already imported it
 #   SECURITY_GROUP_ID    must allow inbound SSH (22) and whatever app port you deploy
 #   SUBNET_ID
 # Optional:
