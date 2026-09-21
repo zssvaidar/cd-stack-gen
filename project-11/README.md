@@ -48,6 +48,15 @@ Each instance in the batch is named `<name>-<i>` (1-indexed) and tagged `Purpose
 ./run.sh instances web 1 delete
 ```
 
+Set `ROLE` and/or `ENVIRONMENT` (env vars, both unset/untagged by default) to add those as
+extra tags — e.g. a deploy pipeline elsewhere that targets `aws ssm send-command --targets
+"Key=tag:Role,Values=app-server" "Key=tag:Environment,Values=production"` needs instances
+tagged with exactly those two to be picked up by that fleet-wide target:
+
+```bash
+ROLE=app-server ENVIRONMENT=production ./run.sh instances web 2 create
+```
+
 ## `run.sh s3 <name> {create|delete}`
 
 `create` makes `$BUCKET_NAME = ${PURPOSE}-${name}-${account_id}` — S3 bucket names are unique

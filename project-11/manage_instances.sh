@@ -13,6 +13,8 @@ source "$STATE_FILE"
 TIER="${TIER:-app}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
 AMI_ID="${AMI_ID:-}"
+ROLE="${ROLE:-}"
+ENVIRONMENT="${ENVIRONMENT:-}"
 
 case "$TIER" in
     bastion) SUBNET_ID="$BASTION_SUBNET_ID"; SG_ID="$BASTION_SG" ;;
@@ -70,9 +72,13 @@ create() {
 
         echo "=== Launching $INSTANCE_NAME (tier=$TIER) ==="
 
+        TAGS="{Key=Purpose,Value=$Purpose},{Key=Name,Value=$INSTANCE_NAME},{Key=Tier,Value=$TIER}"
+        [[ -n "$ROLE" ]] && TAGS="$TAGS,{Key=Role,Value=$ROLE}"
+        [[ -n "$ENVIRONMENT" ]] && TAGS="$TAGS,{Key=Environment,Value=$ENVIRONMENT}"
+
         INSTANCE_ID=$(aws ec2 run-instances \
             "${run_args[@]}" \
-            --tag-specifications "ResourceType=instance,Tags=[{Key=Purpose,Value=$Purpose},{Key=Name,Value=$INSTANCE_NAME},{Key=Tier,Value=$TIER}]" \
+            --tag-specifications "ResourceType=instance,Tags=[$TAGS]" \
             --query 'Instances[0].InstanceId' \
             --output text)
 
