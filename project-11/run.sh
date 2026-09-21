@@ -37,12 +37,17 @@ case "$1" in
         COUNT="${3:?usage: run.sh instances <name> <count> create/delete}"
         source ./manage_instances.sh
         ;;
+    s3)
+        NAME="${2:?usage: run.sh s3 <name> create/delete}"
+        source ./manage_s3.sh
+        ;;
     *)
         echo
         echo "Usage: run.sh keys <name> {create|delete}"
         echo "Usage: run.sh ssm {create|delete}"
         echo "Usage: run.sh network {create|delete}"
         echo "Usage: run.sh instances <name> <count> {create|delete}"
+        echo "Usage: run.sh s3 <name> {create|delete}"
         exit 1
         ;;
 esac

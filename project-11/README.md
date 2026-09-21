@@ -1,6 +1,6 @@
-# project-11 — unified run.sh: keys, network, ssm, instances
+# project-11 — unified run.sh: keys, network, ssm, instances, s3
 
-A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances>
+A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances|s3>
 [args] {create|delete}` sources the matching `manage_*.sh` fragment, all of them sharing one
 Purpose-tagged state log at `state/$PURPOSE.env`. This is a leaner, flatter alternative to
 `project-9/agent-keys` + `project-10/vpc-network` + `project-10/ssm-manage` — same underlying
@@ -14,6 +14,7 @@ export PURPOSE=testing
 ./run.sh keys web-host create          # -> 2026-09-21_web-host, imported to AWS + Vault
 ./run.sh ssm create                    # instance profile wrapping the existing jenkins-role
 ./run.sh instances web 3 create        # 3 instances into the app-tier subnet, using all of the above
+./run.sh s3 app-data create            # -> testing-app-data-<account-id>, blocked/encrypted/versioned
 ```
 
 Every `create` appends to `state/testing.env` — `keys`/`network`/`ssm` write flat `export`
@@ -46,6 +47,27 @@ Each instance in the batch is named `<name>-<i>` (1-indexed) and tagged `Purpose
 ```bash
 ./run.sh instances web 1 delete
 ```
+
+## `run.sh s3 <name> {create|delete}`
+
+`create` makes `$BUCKET_NAME = ${PURPOSE}-${name}-${account_id}` — S3 bucket names are unique
+across *all* of AWS, not just this account, so the account id suffix is what keeps `<name>`
+alone (e.g. `app-data`) from colliding with someone else's bucket. Every bucket gets the same
+three defaults applied, not left opt-in: public access fully blocked, SSE-S3 encryption, and
+versioning enabled. Tagged `Purpose=$PURPOSE`, `Name=<name>`, appended to the state log the
+same way `keys`/`network`/`ssm` are (flat `export BUCKET_NAME=...` — sourcing the log after
+several `s3 create` runs leaves the *last* bucket's name).
+
+```bash
+./run.sh s3 app-data create
+./run.sh s3 app-data delete
+```
+
+`delete` empties the bucket before removing it — including, deliberately, every object
+*version* and delete marker versioning leaves behind, not just current objects. `aws s3 rm
+--recursive` alone only adds delete markers on a versioned bucket; AWS still refuses to delete
+a non-empty bucket afterward. Both purge loops run unconditionally and simply find nothing to
+do if versioning was never turned on, so `delete` doesn't need to know or care.
 
 ## Fixed while porting this in
 
