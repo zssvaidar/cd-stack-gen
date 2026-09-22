@@ -22,5 +22,16 @@ prompt instead of tearing the builder down) or `-debug` (steps through one actio
 pass these by invoking `packer` directly against `packer/` with the same `-var`s if you need
 them, rather than editing `manage_ami.sh` for a one-off debug session.
 
+**Retry any `dnf`/`yum`/`rpm` call.** `packer/ami.pkr.hcl` runs `cloud-init status --wait` before
+this script, so cloud-init's own boot-time package work is done by the time it starts — but that
+only covers cloud-init. Amazon Linux also runs other package-related jobs independent of
+cloud-init's lifecycle (`dnf-makecache.timer`, SSM inventory collection, …), any of which can
+briefly hold the exclusive rpm transaction lock at any point after boot, including *while* this
+script is mid-install. `dnf`/`yum` don't wait for that lock to free — they fail immediately
+(`can't create transaction lock ... Resource temporarily unavailable`). `example.sh`'s
+`retry_pkg()` wraps a command and retries it a few times with a short sleep on failure; wrap any
+`dnf install`/`yum install`/similar call in your own script with it rather than assuming the box
+is quiet.
+
 Override the convention entirely with `PROVISION_SCRIPT=/some/other/path.sh run.sh ami ...`
 if you don't want to name files after the env-type.
