@@ -52,6 +52,10 @@ case "$1" in
         COUNT="${4:?usage: run.sh instance-ami <name> <env-type> <count> create/delete}"
         source ./manage_instance_ami.sh
         ;;
+    egress)
+        NAME="${2:?usage: run.sh egress <name> create/delete}"
+        source ./manage_egress_instance.sh
+        ;;
     *)
         echo
         echo "Usage: run.sh keys <name> {create|delete}"
@@ -61,6 +65,7 @@ case "$1" in
         echo "Usage: run.sh s3 <name> {create|delete}"
         echo "Usage: run.sh ami <name> <env-type> {create|delete}"
         echo "Usage: run.sh instance-ami <name> <env-type> <count> {create|delete}"
+        echo "Usage: run.sh egress <name> {create|delete}"
         exit 1
         ;;
 esac

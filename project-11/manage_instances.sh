@@ -7,7 +7,7 @@
 
 source "$STATE_FILE"
 
-[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
+[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 [[ "$COUNT" =~ ^[0-9]+$ ]] && [ "$COUNT" -ge 1 ] || { echo "error: count must be a positive integer" >&2; exit 1; }
 
 TIER="${TIER:-app}"

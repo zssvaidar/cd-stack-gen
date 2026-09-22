@@ -4,8 +4,13 @@
 provisioner, run against the builder instance before it's snapshotted — that's the one file
 that actually defines what ends up baked into the image. `example.sh` is a minimal, working
 starting point (installs `cloudflared` — the same install this stack already uses in
-[`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `cloud-init-cloudflared.sh`).
-Copy it to `<env-type>.sh` and replace the body with whatever that environment actually needs.
+[`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `cloud-init-cloudflared.sh`). Copy
+it to `<env-type>.sh` and replace the body with whatever that environment actually needs.
+
+`egress-gateway.sh` is the other real one in here, used by `run.sh egress` (see the top-level
+README) — it bakes IP forwarding and NAT into the image instead of installing an app, making
+the resulting instance usable as a self-managed NAT instance rather than something you deploy
+code onto.
 
 **Runs as root.** Packer connects over SSH as `ec2-user`, not root, but `packer/ami.pkr.hcl`'s
 provisioner block wraps the script in `sudo` (`execute_command`) — the same effective privilege

@@ -4,7 +4,7 @@ export VAULT_ADDR="http://127.0.0.1:8200"
 VAULT_KV_PATH="${VAULT_KV_PATH:-secret/jenkins}"
 SCRIPT_DIR=$(pwd)
 
-[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
+[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 [[ -f "$STATE_FILE" ]] || { echo "no state file $STATE_FILE"; exit 1; }
 
 statefile() {

@@ -1,10 +1,10 @@
-# project-11 — unified run.sh: keys, network, ssm, instances, s3, ami
+# project-11 — unified run.sh: keys, network, ssm, instances, s3, ami, egress
 
 A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances|s3|
-ami|instance-ami> [args] {create|delete}` sources the matching `manage_*.sh` fragment, all of
-them sharing one Purpose-tagged state log at `state/$PURPOSE.env`. This is a leaner, flatter
-alternative to `project-9/agent-keys` + `project-10/vpc-network` + `project-10/ssm-manage` —
-same underlying AWS calls, one entry point and one state file instead of four separate ones.
+ami|instance-ami|egress> [args] {create|delete}` sources the matching `manage_*.sh` fragment,
+all of them sharing one Purpose-tagged state log at `state/$PURPOSE.env`. This is a leaner,
+flatter alternative to `project-9/agent-keys` + `project-10/vpc-network` + `project-10/ssm-manage`
+— same underlying AWS calls, one entry point and one state file instead of four separate ones.
 
 ```bash
 cp wrapper/config/.env.example wrapper/config/.env   # fill in the creator credentials, once
@@ -17,6 +17,8 @@ export PURPOSE=testing
 ./run.sh s3 app-data create                # -> testing-app-data-<account-id>, blocked/encrypted/versioned
 ./run.sh ami myapp production create       # bake a custom AMI (see below)
 ./run.sh instance-ami myapp production 2 create   # launch instances from it
+./run.sh ami gw egress-gateway create      # bake the NAT-instance AMI (see "egress" below)
+./run.sh egress gw create                  # launch it, relay the app tier's outbound traffic through it
 ```
 
 Every `create` appends to `state/testing.env` — `keys`/`network`/`ssm` write flat `export`
@@ -160,6 +162,61 @@ each one, and deletes its backing snapshot(s) — looked up *before* deregisteri
 image's metadata (and the snapshot IDs in it) disappears the moment it's deregistered. This
 side is unchanged from before Packer: Packer builds images, it doesn't manage teardown of what
 it built, so cleanup stays plain `aws` CLI, same as the rest of this project.
+
+## `run.sh egress <name> {create|delete}`
+
+A small public EC2 instance acting as a self-managed NAT instance — the cheap, DIY version of a
+NAT Gateway. `manage_network.sh`'s app/db subnets have a route to the Internet Gateway already
+(all three tiers share `PUBLIC_RT_ID`) but no public IP and no NAT, so nothing in them can
+actually reach the internet. This fills that gap: private instances keep no public IP of their
+own (e.g. an app instance running its own `cloudflared`, same as `bun-hydrate`) and route their
+outbound traffic through this one relay instead.
+
+```bash
+export ENV_TYPE=egress-gateway
+./run.sh ami gw egress-gateway create      # bake the NAT-capable AMI - see ami-scripts/README.md
+./run.sh egress gw create                  # launch it and rewire the app subnet at it
+```
+
+`create`:
+1. Looks up the AMI built via `run.sh ami <ami-name> egress-gateway create` (`AMI_NAME`, default
+   same as this instance's `<name>`, lets the AMI and the instance be named independently).
+2. Creates a dedicated security group allowing all traffic in from the VPC's own CIDR (looked
+   up from `$VPC_ID`, not hardcoded) — forwarded traffic hitting this instance's ENI is filtered
+   by its security group exactly like traffic addressed to the instance itself, so this has to
+   be broader than the empty per-tier SGs `manage_network.sh` creates.
+3. Launches into `$TIER` (default `bastion`) **with a public IP** — it has to have one, that's
+   the entire point — then disables source/dest check on it (`modify-instance-attribute
+   --no-source-dest-check`), the one EC2-API-level setting that actually makes an instance route
+   traffic instead of AWS silently dropping anything not addressed to it, no matter what the OS
+   does.
+4. Creates a new route table with `0.0.0.0/0 -> <this instance>`, then points `RELAY_SUBNET_IDS`
+   (env var, default `$APP_SUBNET_ID` only) at it via `replace-route-table-association` — those
+   subnets leave the shared `PUBLIC_RT_ID` and start routing their default traffic through the
+   gateway instead of straight to the Internet Gateway (which never worked for them anyway,
+   since they have no public IP for its 1:1 NAT to use).
+
+The AMI itself (`ami-scripts/egress-gateway.sh`) bakes in IP forwarding and an nftables
+MASQUERADE rule, persisted across reboots by a systemd unit that re-resolves the primary
+network interface at every boot rather than hardcoding `eth0`/`ens5`. Its forward chain only
+accepts traffic sourced from RFC1918 ranges — a public instance with an unrestricted forward
+chain is an open relay for anyone on the internet who can route packets to it.
+
+**DB tier is deliberately left off by default** — `RELAY_SUBNET_IDS` only includes
+`$APP_SUBNET_ID` unless you override it (e.g. `RELAY_SUBNET_IDS="$APP_SUBNET_ID $DB_SUBNET_ID"`).
+A tier that shouldn't need outbound internet access in the first place shouldn't get it just
+because it's convenient.
+
+`delete` finds the gateway instance(s) by `Purpose`/`Name`/`Role=egress-gateway` tags, then —
+for each one — finds every route table with a route pointing *at* that instance-id (not by
+trusting `RELAY_SUBNET_IDS` to still match what `create` was run with; the route tables
+themselves are the source of truth for what's currently relayed through it), restores each of
+those subnets to `$PUBLIC_RT_ID`, deletes the private route table, terminates the instance, and
+finally deletes its security group:
+
+```bash
+./run.sh egress gw delete
+```
 
 ## Fixed while porting this in
 
