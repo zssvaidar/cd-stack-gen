@@ -55,6 +55,14 @@ build {
 
   provisioner "shell" {
     script = var.provision_script
+
+    # unlike the old cloud-init/user-data approach (which ran as root automatically), Packer's
+    # shell provisioner connects as $ssh_username and runs the script as that user with no
+    # elevation by default - ami-scripts/*.sh scripts write to root-owned paths (/etc/yum.repos.d,
+    # systemd units, package installs), so run the whole script under sudo rather than requiring
+    # every script author to remember to prefix each command themselves. Amazon Linux's ec2-user
+    # has passwordless sudo out of the box.
+    execute_command = "chmod +x {{ .Path }} && sudo {{ .Vars }} {{ .Path }}"
   }
 
   # packer build's own stdout isn't meant to be parsed - the manifest post-processor writes a
