@@ -96,10 +96,12 @@ out of Packer's manifest (`packer/packer-manifest.json`, gitignored) to append t
    from `run.sh ssm create` — same state-file wiring as everything else in this project.
 2. Runs `packer build` against `packer/ami.pkr.hcl`, passing all of the above as `-var`s.
    Packer launches its own temporary builder instance, connects over **SSH** (not SSM — see
-   below), runs `ami-scripts/<env-type>.sh` as a shell provisioner — **that script is what
-   actually defines the image**; see `ami-scripts/README.md` — then snapshots it into an AMI,
-   tags the AMI/snapshot/builder, and tears the builder back down itself. None of that
-   mechanics lives in bash anymore.
+   below) as soon as sshd answers, waits for `cloud-init status --wait` to finish (cloud-init
+   does its own `dnf`/`rpm` work at boot — starting the real provisioner before that's done
+   races it for the rpm lock), then runs `ami-scripts/<env-type>.sh` as a shell provisioner
+   under `sudo` — **that script is what actually defines the image**; see
+   `ami-scripts/README.md` — then snapshots it into an AMI, tags the AMI/snapshot/builder, and
+   tears the builder back down itself. None of that mechanics lives in bash anymore.
 3. Parses `packer/packer-manifest.json` with `jq` for the built AMI's ID and name, then appends
    them to `$STATE_FILE`.
 

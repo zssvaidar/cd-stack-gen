@@ -53,6 +53,16 @@ source "amazon-ebs" "ami" {
 build {
   sources = ["source.amazon-ebs.ami"]
 
+  # Packer's SSH connection comes up the moment sshd is reachable, which is well before
+  # cloud-init's own boot-time dnf/rpm work (repo metadata refresh, package updates) has
+  # finished - the actual provisioning script starting at the same time then collides with it
+  # on the rpm lock ("can't create transaction lock ... Resource temporarily unavailable").
+  # Block on cloud-init finishing first, so by the time the real script's dnf/rpm calls run,
+  # nothing else on the box still has the lock.
+  provisioner "shell" {
+    inline = ["cloud-init status --wait"]
+  }
+
   provisioner "shell" {
     script = var.provision_script
 
