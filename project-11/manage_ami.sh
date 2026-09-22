@@ -1,8 +1,9 @@
-# Builds a custom AMI: launches a temporary "builder" instance from a base AMI, runs a
-# provisioning script as user-data (which script depends on ENV_TYPE - see ami-scripts/),
-# waits for it to finish, stops the instance for a consistent snapshot, creates a tagged
-# image from it, waits for the image to become available, then terminates the builder - the
-# AMI is what's kept, not the instance.
+# Builds a custom AMI with Packer instead of hand-rolled EC2 API calls: packer/ami.pkr.hcl
+# owns the actual build mechanics (launch, wait for SSH, run the provisioner, snapshot, tag,
+# tear down its own temporary keypair and the builder instance) - this script resolves the
+# inputs from $STATE_FILE, drives `packer init/validate/build`, and reads the resulting AMI
+# ID back out of Packer's manifest to append to state. delete() is unchanged from before:
+# Packer builds, it doesn't manage teardown of what it built, so cleanup stays plain aws cli.
 
 source "$STATE_FILE"
 
@@ -13,12 +14,10 @@ PROVISION_SCRIPT="${PROVISION_SCRIPT:-ami-scripts/${ENV_TYPE}.sh}"
 TIER="${TIER:-app}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
 BASE_AMI_ID="${BASE_AMI_ID:-}"
-# manage_network.sh's subnets don't auto-assign public IPs and there's no NAT gateway in this
-# network, so without one the builder has a route to the internet gateway but nothing for it
-# to NAT with - outbound package downloads in the provisioning script would just hang. The
-# builder is temporary and terminated right after imaging, so giving it one is low-stakes;
-# set ASSIGN_PUBLIC_IP=false if you've set up a NAT gateway instead and don't want one.
 ASSIGN_PUBLIC_IP="${ASSIGN_PUBLIC_IP:-true}"
+
+PACKER_DIR="packer"
+MANIFEST_FILE="$PACKER_DIR/packer-manifest.json"
 
 case "$TIER" in
     bastion) SUBNET_ID="$BASTION_SUBNET_ID"; SG_ID="$BASTION_SG" ;;
@@ -45,6 +44,9 @@ statefile() {
 }
 
 create() {
+    command -v packer >/dev/null 2>&1 || { echo "error: packer not found - https://developer.hashicorp.com/packer/install" >&2; exit 1; }
+    command -v jq >/dev/null 2>&1 || { echo "error: jq not found - needed to read packer's manifest" >&2; exit 1; }
+
     [[ -f "$PROVISION_SCRIPT" ]] || { echo "error: PROVISION_SCRIPT not found: $PROVISION_SCRIPT" >&2; exit 1; }
 
     if [[ -z "$BASE_AMI_ID" ]]; then
@@ -57,110 +59,71 @@ create() {
         echo "BASE_AMI_ID: $BASE_AMI_ID"
     fi
 
-    local run_args=(
-        --region "$AWS_REGION"
-        --image-id "$BASE_AMI_ID"
-        --instance-type "$INSTANCE_TYPE"
-        --subnet-id "$SUBNET_ID"
-        --security-group-ids "$SG_ID"
-        --user-data "file://$PROVISION_SCRIPT"
-    )
-    [[ -n "$DATE_NAME" ]] && run_args+=(--key-name "$DATE_NAME")
-    [[ -n "$INSTANCE_PROFILE_NAME" ]] && run_args+=(--iam-instance-profile "Name=$INSTANCE_PROFILE_NAME")
-    [[ "$ASSIGN_PUBLIC_IP" == "true" ]] && run_args+=(--associate-public-ip-address)
-
 
     # --------------------------------------------------
-    # Launch the builder
+    # Preflight: Packer connects over plain SSH, so the chosen tier's security group needs
+    # to actually allow it in - manage_network.sh creates all three tiers with zero rules,
+    # so this is very likely the first thing to trip someone up. Warn, don't block - there
+    # are legitimate reasons this check could be wrong (a broader rule that isn't an exact
+    # port-22 match, SSH allowed by a different mechanism entirely).
     # --------------------------------------------------
 
-    echo "=== Launching builder instance from $BASE_AMI_ID ==="
-
-    BUILDER_ID=$(aws ec2 run-instances \
-        "${run_args[@]}" \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Purpose,Value=$Purpose},{Key=Name,Value=ami-builder-$NAME-$ENV_TYPE}]" \
-        --query 'Instances[0].InstanceId' \
-        --output text)
-
-    echo "Builder instance: $BUILDER_ID"
-    echo "waiting for it to be running..."
-    aws ec2 wait instance-running --region "$AWS_REGION" --instance-ids "$BUILDER_ID"
-
-
-    # --------------------------------------------------
-    # Wait for the provisioning script (user-data) to finish
-    # --------------------------------------------------
-    # cloud-init runs user-data asynchronously after boot - `instance-running` only means the
-    # instance answered, not that provisioning is done. `cloud-init status --wait` blocks
-    # until it actually is; run it over SSM and poll for up to 5 minutes, same pattern
-    # bun-hydrate's Jenkinsfile already uses for its own SSM command polling.
-
-    echo "=== Waiting for provisioning to finish ==="
-
-    COMMAND_ID=$(aws ssm send-command \
+    SSH_RULE_COUNT=$(aws ec2 describe-security-group-rules \
         --region "$AWS_REGION" \
-        --instance-ids "$BUILDER_ID" \
-        --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["cloud-init status --wait"]' \
-        --query 'Command.CommandId' --output text)
+        --filters "Name=group-id,Values=$SG_ID" \
+        --query "length(SecurityGroupRules[?IsEgress==\`false\` && FromPort==\`22\`])" \
+        --output text 2>/dev/null)
 
-    STATUS=""
-    for i in $(seq 1 60); do
-        STATUS=$(aws ssm list-command-invocations \
-            --region "$AWS_REGION" \
-            --command-id "$COMMAND_ID" \
-            --query 'CommandInvocations[0].Status' --output text 2>/dev/null)
-        case "$STATUS" in
-            Pending|InProgress|""|None) sleep 5 ;;
-            *) break ;;
-        esac
-    done
-
-    if [[ "$STATUS" != "Success" ]]; then
-        echo "error: provisioning did not succeed on $BUILDER_ID (status=$STATUS) - leaving it running for inspection" >&2
-        exit 1
+    if [[ "$SSH_RULE_COUNT" == "0" ]]; then
+        echo "warning: $SG_ID has no inbound rule for port 22 - Packer's SSH connection to the" >&2
+        echo "builder will hang until it times out. Add one first, e.g.:" >&2
+        echo "  ../project-10/security-groups/scripts/add-rule.sh --sg $SG_ID --direction ingress \\" >&2
+        echo "      --protocol tcp --port 22 --cidr <your-ip>/32" >&2
     fi
-    echo "provisioning finished"
 
 
     # --------------------------------------------------
-    # Stop for a consistent snapshot, then image it
+    # Build
     # --------------------------------------------------
 
-    echo "=== Stopping builder for a consistent snapshot ==="
+    local packer_vars=(
+        -var "aws_region=$AWS_REGION"
+        -var "purpose=$Purpose"
+        -var "name=$NAME"
+        -var "env_type=$ENV_TYPE"
+        -var "provision_script=$(cd "$(dirname "$PROVISION_SCRIPT")" && pwd)/$(basename "$PROVISION_SCRIPT")"
+        -var "base_ami_id=$BASE_AMI_ID"
+        -var "subnet_id=$SUBNET_ID"
+        -var "security_group_id=$SG_ID"
+        -var "instance_type=$INSTANCE_TYPE"
+        -var "assign_public_ip=$ASSIGN_PUBLIC_IP"
+        -var "instance_profile_name=$INSTANCE_PROFILE_NAME"
+    )
 
-    aws ec2 stop-instances --region "$AWS_REGION" --instance-ids "$BUILDER_ID" >/dev/null
-    aws ec2 wait instance-stopped --region "$AWS_REGION" --instance-ids "$BUILDER_ID"
+    echo "=== packer init ==="
+    packer init "$PACKER_DIR" || exit 1
 
-    AMI_NAME="${Purpose}-${NAME}-${ENV_TYPE}-$(date +%Y%m%d%H%M%S)"
+    echo "=== packer validate ==="
+    packer validate "${packer_vars[@]}" "$PACKER_DIR" || exit 1
 
-    echo "=== Creating image $AMI_NAME ==="
+    echo "=== packer build ==="
+    rm -f "$MANIFEST_FILE"
 
-    AMI_ID=$(aws ec2 create-image \
-        --region "$AWS_REGION" \
-        --instance-id "$BUILDER_ID" \
-        --name "$AMI_NAME" \
-        --description "Built by manage_ami.sh for $NAME/$ENV_TYPE, Purpose=$Purpose" \
-        --tag-specifications \
-            "ResourceType=image,Tags=[{Key=Purpose,Value=$Purpose},{Key=Name,Value=$NAME},{Key=Environment,Value=$ENV_TYPE}]" \
-            "ResourceType=snapshot,Tags=[{Key=Purpose,Value=$Purpose},{Key=Name,Value=$NAME},{Key=Environment,Value=$ENV_TYPE}]" \
-        --query 'ImageId' --output text)
+    # the manifest post-processor's `output` is resolved relative to whatever directory
+    # `packer build` is invoked FROM, not the template directory it's pointed at - cd into
+    # $PACKER_DIR so the manifest lands at $MANIFEST_FILE like the rest of this script assumes,
+    # instead of one level up in $PACKER_DIR's parent.
+    (cd "$PACKER_DIR" && packer build "${packer_vars[@]}" .) || exit 1
 
-    echo "waiting for $AMI_ID to become available (this can take a few minutes)..."
-    aws ec2 wait image-available --region "$AWS_REGION" --image-ids "$AMI_ID"
+    [[ -f "$MANIFEST_FILE" ]] || { echo "error: packer build did not produce $MANIFEST_FILE" >&2; exit 1; }
 
 
     # --------------------------------------------------
-    # The AMI is the product - the builder isn't needed anymore
+    # Read the result back out of Packer's manifest, not its stdout
     # --------------------------------------------------
 
-    echo "=== Terminating builder instance ==="
-    aws ec2 terminate-instances --region "$AWS_REGION" --instance-ids "$BUILDER_ID" >/dev/null
-
-
-    # --------------------------------------------------
-    # Summary
-    # --------------------------------------------------
+    AMI_ID=$(jq -r '.builds[-1].artifact_id' "$MANIFEST_FILE" | cut -d: -f2)
+    AMI_NAME=$(jq -r '.builds[-1].custom_data.ami_name // empty' "$MANIFEST_FILE")
 
     echo
     echo "========================================"

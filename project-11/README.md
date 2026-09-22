@@ -85,32 +85,59 @@ do if versioning was never turned on, so `delete` doesn't need to know or care.
 Two scripts, one job split in half: **`ami`** bakes a custom image, **`instance-ami`** launches
 instances from one — same split as "build a golden image" vs. "launch it" anywhere else.
 
-`ami create`:
-1. Launches a temporary "builder" instance (same subnet/key/instance-profile wiring as
-   `instances`) from a base AMI (latest Amazon Linux 2023 by default, override with
-   `BASE_AMI_ID`), with `ami-scripts/<env-type>.sh` attached as user-data — **that script is
-   what actually defines the image**; see `ami-scripts/README.md`.
-2. Waits for it to actually finish provisioning — `cloud-init status --wait` run over SSM,
-   polled for up to 5 minutes (`instance-running` only means the instance answered, not that
-   user-data has finished).
-3. Stops the builder (a consistent filesystem snapshot beats letting `create-image` reboot it
-   mid-flight), creates the image, tags both the image and its snapshot, waits for the image to
-   become `available`, then terminates the builder — the *image* is the deliverable, not the
-   instance.
+`ami create` builds the image with [Packer](https://developer.hashicorp.com/packer) instead of
+hand-rolled EC2 API calls (launch, wait, snapshot, tag, terminate) — `packer/ami.pkr.hcl` owns
+the actual build mechanics, `manage_ami.sh` just resolves inputs out of `$STATE_FILE`, drives
+`packer init` → `packer validate` → `packer build`, and reads the resulting AMI ID/name back
+out of Packer's manifest (`packer/packer-manifest.json`, gitignored) to append to state:
+
+1. Resolves a base AMI (latest Amazon Linux 2023 by default, override with `BASE_AMI_ID`), the
+   tier's subnet/security-group (same `TIER` variable as `instances`), and the instance profile
+   from `run.sh ssm create` — same state-file wiring as everything else in this project.
+2. Runs `packer build` against `packer/ami.pkr.hcl`, passing all of the above as `-var`s.
+   Packer launches its own temporary builder instance, connects over **SSH** (not SSM — see
+   below), runs `ami-scripts/<env-type>.sh` as a shell provisioner — **that script is what
+   actually defines the image**; see `ami-scripts/README.md` — then snapshots it into an AMI,
+   tags the AMI/snapshot/builder, and tears the builder back down itself. None of that
+   mechanics lives in bash anymore.
+3. Parses `packer/packer-manifest.json` with `jq` for the built AMI's ID and name, then appends
+   them to `$STATE_FILE`.
 
 ```bash
 export ENV_TYPE=production   # picks ami-scripts/production.sh by default
 ./run.sh ami myapp production create
 ```
 
-**The builder gets a public IP by default** (`--associate-public-ip-address`, on unless
-`ASSIGN_PUBLIC_IP=false`). It has to: `manage_network.sh`'s subnets don't auto-assign public
-IPs and this network has no NAT gateway, so without one the builder would have a route to the
-Internet Gateway but nothing for it to NAT with — outbound package downloads in the
-provisioning script (`curl`, `dnf install`, …) would just hang. It's low-stakes since the
-builder is temporary and terminated right after imaging; set `ASSIGN_PUBLIC_IP=false` only if
-you've set up a NAT gateway instead. The same reasoning applies to `instances`/`instance-ami`
-if their app needs outbound internet access too — neither passes the flag today.
+Prerequisites: `packer` and `jq` on PATH (`create` checks for both up front and fails fast with
+an install link if either is missing; `delete` needs neither). Packer generates its own
+ephemeral ed25519 keypair for each build and discards it afterward — the builder's SSH access
+never depends on, or extends, anything from `run.sh keys`.
+
+**The tier's security group needs an inbound rule for port 22**, since Packer connects over
+plain SSH rather than through SSM — `manage_network.sh` creates all three tiers with zero
+ingress rules, so this is the most likely first thing to trip up a cold start. `create` checks
+for one and warns (doesn't block, since a broader rule or a different exact match could still
+be fine) if it doesn't find an exact port-22 rule on the tier's SG:
+
+```bash
+../project-10/security-groups/scripts/add-rule.sh --sg <sg-id> --direction ingress \
+    --protocol tcp --port 22 --cidr <your-ip>/32
+```
+
+An SSM-only alternative exists (Packer's `ssh_interface = "session_manager"`) that would avoid
+opening port 22 at all, at the cost of needing the `session-manager-plugin` installed wherever
+`packer build` runs plus broader IAM permissions on the builder's instance profile — documented
+here as a known follow-up, not built, since it's harder to test without a real AWS account.
+
+**The builder gets a public IP by default** (`ASSIGN_PUBLIC_IP=true`, passed through to
+Packer's `associate_public_ip_address`). It has to: `manage_network.sh`'s subnets don't
+auto-assign public IPs and this network has no NAT gateway, so without one the builder would
+have a route to the Internet Gateway but nothing for it to NAT with — both the provisioning
+script's own downloads (`curl`, `dnf install`, …) and Packer's SSH connection itself would just
+hang. It's low-stakes since the builder is temporary and torn down right after imaging; set
+`ASSIGN_PUBLIC_IP=false` only if you've set up a NAT gateway instead. The same reasoning applies
+to `instances`/`instance-ami` if their app needs outbound internet access too — neither passes
+the flag today.
 
 State is keyed by `<name>`/`<env-type>` together (`AMI_MYAPP_PRODUCTION_ID`, same collision-safe
 prefixing as `instances`), so `myapp`/`staging` and `myapp`/`production` coexist in the same
@@ -118,7 +145,8 @@ log without clobbering each other.
 
 `instance-ami create` looks up that exact `AMI_..._ID` and launches `<count>` instances from
 it — same tier/key/profile wiring, same `ROLE` tag support, as `instances`, just sourcing the
-AMI from this registry instead of the latest-AL2023 lookup:
+AMI from this registry instead of the latest-AL2023 lookup. It's unaffected by the Packer
+rewrite — it only ever reads an `AMI_..._ID` out of state, agnostic to how that AMI got built:
 
 ```bash
 ./run.sh instance-ami myapp production 3 create
@@ -127,7 +155,9 @@ AMI from this registry instead of the latest-AL2023 lookup:
 
 `ami delete` finds every AMI tagged with that exact `Purpose`/`Name`/`Environment`, deregisters
 each one, and deletes its backing snapshot(s) — looked up *before* deregistering, since an
-image's metadata (and the snapshot IDs in it) disappears the moment it's deregistered.
+image's metadata (and the snapshot IDs in it) disappears the moment it's deregistered. This
+side is unchanged from before Packer: Packer builds images, it doesn't manage teardown of what
+it built, so cleanup stays plain `aws` CLI, same as the rest of this project.
 
 ## Fixed while porting this in
 
