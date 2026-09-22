@@ -1,20 +1,22 @@
-# project-11 — unified run.sh: keys, network, ssm, instances, s3
+# project-11 — unified run.sh: keys, network, ssm, instances, s3, ami
 
-A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances|s3>
-[args] {create|delete}` sources the matching `manage_*.sh` fragment, all of them sharing one
-Purpose-tagged state log at `state/$PURPOSE.env`. This is a leaner, flatter alternative to
-`project-9/agent-keys` + `project-10/vpc-network` + `project-10/ssm-manage` — same underlying
-AWS calls, one entry point and one state file instead of four separate ones.
+A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances|s3|
+ami|instance-ami> [args] {create|delete}` sources the matching `manage_*.sh` fragment, all of
+them sharing one Purpose-tagged state log at `state/$PURPOSE.env`. This is a leaner, flatter
+alternative to `project-9/agent-keys` + `project-10/vpc-network` + `project-10/ssm-manage` —
+same underlying AWS calls, one entry point and one state file instead of four separate ones.
 
 ```bash
 cp wrapper/config/.env.example wrapper/config/.env   # fill in the creator credentials, once
 export PURPOSE=testing
 
-./run.sh network create                # vpc + bastion/app/db security groups + subnets
-./run.sh keys web-host create          # -> 2026-09-21_web-host, imported to AWS + Vault
-./run.sh ssm create                    # instance profile wrapping the existing jenkins-role
-./run.sh instances web 3 create        # 3 instances into the app-tier subnet, using all of the above
-./run.sh s3 app-data create            # -> testing-app-data-<account-id>, blocked/encrypted/versioned
+./run.sh network create                    # vpc + bastion/app/db security groups + subnets
+./run.sh keys web-host create              # -> 2026-09-21_web-host, imported to AWS + Vault
+./run.sh ssm create                        # instance profile wrapping the existing jenkins-role
+./run.sh instances web 3 create            # 3 instances into the app-tier subnet, using all of the above
+./run.sh s3 app-data create                # -> testing-app-data-<account-id>, blocked/encrypted/versioned
+./run.sh ami myapp production create       # bake a custom AMI (see below)
+./run.sh instance-ami myapp production 2 create   # launch instances from it
 ```
 
 Every `create` appends to `state/testing.env` — `keys`/`network`/`ssm` write flat `export`
@@ -77,6 +79,46 @@ several `s3 create` runs leaves the *last* bucket's name).
 --recursive` alone only adds delete markers on a versioned bucket; AWS still refuses to delete
 a non-empty bucket afterward. Both purge loops run unconditionally and simply find nothing to
 do if versioning was never turned on, so `delete` doesn't need to know or care.
+
+## `run.sh ami <name> <env-type> {create|delete}` + `run.sh instance-ami <name> <env-type> <count> {create|delete}`
+
+Two scripts, one job split in half: **`ami`** bakes a custom image, **`instance-ami`** launches
+instances from one — same split as "build a golden image" vs. "launch it" anywhere else.
+
+`ami create`:
+1. Launches a temporary "builder" instance (same subnet/key/instance-profile wiring as
+   `instances`) from a base AMI (latest Amazon Linux 2023 by default, override with
+   `BASE_AMI_ID`), with `ami-scripts/<env-type>.sh` attached as user-data — **that script is
+   what actually defines the image**; see `ami-scripts/README.md`.
+2. Waits for it to actually finish provisioning — `cloud-init status --wait` run over SSM,
+   polled for up to 5 minutes (`instance-running` only means the instance answered, not that
+   user-data has finished).
+3. Stops the builder (a consistent filesystem snapshot beats letting `create-image` reboot it
+   mid-flight), creates the image, tags both the image and its snapshot, waits for the image to
+   become `available`, then terminates the builder — the *image* is the deliverable, not the
+   instance.
+
+```bash
+export ENV_TYPE=production   # picks ami-scripts/production.sh by default
+./run.sh ami myapp production create
+```
+
+State is keyed by `<name>`/`<env-type>` together (`AMI_MYAPP_PRODUCTION_ID`, same collision-safe
+prefixing as `instances`), so `myapp`/`staging` and `myapp`/`production` coexist in the same
+log without clobbering each other.
+
+`instance-ami create` looks up that exact `AMI_..._ID` and launches `<count>` instances from
+it — same tier/key/profile wiring, same `ROLE` tag support, as `instances`, just sourcing the
+AMI from this registry instead of the latest-AL2023 lookup:
+
+```bash
+./run.sh instance-ami myapp production 3 create
+./run.sh instance-ami myapp production 1 delete   # <count> only matters for create
+```
+
+`ami delete` finds every AMI tagged with that exact `Purpose`/`Name`/`Environment`, deregisters
+each one, and deletes its backing snapshot(s) — looked up *before* deregistering, since an
+image's metadata (and the snapshot IDs in it) disappears the moment it's deregistered.
 
 ## Fixed while porting this in
 

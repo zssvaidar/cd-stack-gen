@@ -1,20 +1,23 @@
-# EC2 instances launched into the network/keys/ssm resources already in $STATE_FILE - source
-# it first so DATE_NAME (from `run.sh keys`), INSTANCE_PROFILE_NAME (from `run.sh ssm`), and
-# the VPC's subnets/security groups (from `run.sh network`) are all in scope without
-# re-specifying any of them by hand. If keys/network/ssm were each run more than once under
-# this Purpose, sourcing the whole log leaves whatever each one's *last* entry set - same
-# "latest wins" behavior as manage_keys.sh's own delete().
+# Launches EC2 instances from a custom AMI built by `run.sh ami <name> <env-type> create` -
+# looked up in $STATE_FILE by that same <name>/<env-type> pair, instead of
+# manage_instances.sh's default latest-Amazon-Linux-2023 lookup. Same subnet/security
+# group/key/instance-profile wiring as manage_instances.sh otherwise.
 
 source "$STATE_FILE"
 
 [[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 [[ "$COUNT" =~ ^[0-9]+$ ]] && [ "$COUNT" -ge 1 ] || { echo "error: count must be a positive integer" >&2; exit 1; }
 
+ENV_TYPE="${ENV_TYPE:?set ENV_TYPE, matching what you built with 'run.sh ami'}"
 TIER="${TIER:-app}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
-AMI_ID="${AMI_ID:-}"
 ROLE="${ROLE:-}"
-ENVIRONMENT="${ENVIRONMENT:-}"
+
+AMI_KEY="AMI_$(echo "${NAME}_${ENV_TYPE}" | tr '-' '_' | tr '[:lower:]' '[:upper:]')"
+AMI_ID_VAR="${AMI_KEY}_ID"
+AMI_ID="${!AMI_ID_VAR}"
+
+: "${AMI_ID:?no AMI found for name=$NAME env-type=$ENV_TYPE in $STATE_FILE - run 'run.sh ami $NAME $ENV_TYPE create' first}"
 
 case "$TIER" in
     bastion) SUBNET_ID="$BASTION_SUBNET_ID"; SG_ID="$BASTION_SG" ;;
@@ -35,9 +38,10 @@ statefile() {
 
     {
         echo
-        echo "# $INSTANCE_NAME"
+        echo "# $INSTANCE_NAME (from AMI $AMI_ID)"
         echo "export AWS_REGION=\"$AWS_REGION\""
         echo "export ${var_prefix}_ID=\"$INSTANCE_ID\""
+        echo "export ${var_prefix}_AMI_ID=\"$AMI_ID\""
         echo "export ${var_prefix}_TIER=\"$TIER\""
         echo "export ${var_prefix}_PUBLIC_IP=\"$PUBLIC_IP\""
         echo "export ${var_prefix}_PRIVATE_IP=\"$PRIVATE_IP\""
@@ -47,16 +51,6 @@ statefile() {
 }
 
 create() {
-    if [[ -z "$AMI_ID" ]]; then
-        echo "AMI_ID not set - looking up the latest Amazon Linux 2023 AMI for $AWS_REGION"
-        AMI_ID=$(aws ssm get-parameters \
-            --region "$AWS_REGION" \
-            --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
-            --query 'Parameters[0].Value' \
-            --output text)
-        echo "AMI_ID: $AMI_ID"
-    fi
-
     local run_args=(
         --region "$AWS_REGION"
         --image-id "$AMI_ID"
@@ -68,13 +62,12 @@ create() {
     [[ -n "$INSTANCE_PROFILE_NAME" ]] && run_args+=(--iam-instance-profile "Name=$INSTANCE_PROFILE_NAME")
 
     for i in $(seq 1 "$COUNT"); do
-        INSTANCE_NAME="${NAME}-${i}"
+        INSTANCE_NAME="${NAME}-${ENV_TYPE}-${i}"
 
-        echo "=== Launching $INSTANCE_NAME (tier=$TIER) ==="
+        echo "=== Launching $INSTANCE_NAME from $AMI_ID (tier=$TIER) ==="
 
-        TAGS="{Key=Purpose,Value=$Purpose},{Key=Name,Value=$INSTANCE_NAME},{Key=Tier,Value=$TIER}"
+        TAGS="{Key=Purpose,Value=$Purpose},{Key=Name,Value=$INSTANCE_NAME},{Key=Tier,Value=$TIER},{Key=Environment,Value=$ENV_TYPE}"
         [[ -n "$ROLE" ]] && TAGS="$TAGS,{Key=Role,Value=$ROLE}"
-        [[ -n "$ENVIRONMENT" ]] && TAGS="$TAGS,{Key=Environment,Value=$ENVIRONMENT}"
 
         INSTANCE_ID=$(aws ec2 run-instances \
             "${run_args[@]}" \
@@ -97,16 +90,16 @@ create() {
 
     echo
     echo "========================================"
-    echo "$COUNT instance(s) launched under '$NAME' (tier=$TIER)"
+    echo "$COUNT instance(s) launched from $AMI_ID under '$NAME' ($ENV_TYPE, tier=$TIER)"
     echo "========================================"
 }
 
 delete() {
-    echo "=== Finding instances tagged Purpose=$Purpose, Name=${NAME}-* ==="
+    echo "=== Finding instances tagged Purpose=$Purpose, Name=${NAME}-${ENV_TYPE}-* ==="
 
     INSTANCE_IDS=$(aws ec2 describe-instances \
         --region "$AWS_REGION" \
-        --filters "Name=tag:Purpose,Values=$Purpose" "Name=tag:Name,Values=${NAME}-*" \
+        --filters "Name=tag:Purpose,Values=$Purpose" "Name=tag:Name,Values=${NAME}-${ENV_TYPE}-*" \
                    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
         --query 'Reservations[*].Instances[*].InstanceId' \
         --output text)
@@ -126,7 +119,7 @@ delete() {
     echo "note: $STATE_FILE is an append-only log - these instances' entries stay there for history"
 }
 
-case "$4" in
+case "$5" in
     create)
         create
         ;;
@@ -134,7 +127,7 @@ case "$4" in
         delete
         ;;
     *)
-        echo "Usage run.sh instances <name> <count> {create|delete}"
+        echo "Usage run.sh instance-ami <name> <env-type> <count> {create|delete}"
         exit 1
         ;;
 esac
