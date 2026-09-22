@@ -13,6 +13,12 @@ PROVISION_SCRIPT="${PROVISION_SCRIPT:-ami-scripts/${ENV_TYPE}.sh}"
 TIER="${TIER:-app}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
 BASE_AMI_ID="${BASE_AMI_ID:-}"
+# manage_network.sh's subnets don't auto-assign public IPs and there's no NAT gateway in this
+# network, so without one the builder has a route to the internet gateway but nothing for it
+# to NAT with - outbound package downloads in the provisioning script would just hang. The
+# builder is temporary and terminated right after imaging, so giving it one is low-stakes;
+# set ASSIGN_PUBLIC_IP=false if you've set up a NAT gateway instead and don't want one.
+ASSIGN_PUBLIC_IP="${ASSIGN_PUBLIC_IP:-true}"
 
 case "$TIER" in
     bastion) SUBNET_ID="$BASTION_SUBNET_ID"; SG_ID="$BASTION_SG" ;;
@@ -61,6 +67,7 @@ create() {
     )
     [[ -n "$DATE_NAME" ]] && run_args+=(--key-name "$DATE_NAME")
     [[ -n "$INSTANCE_PROFILE_NAME" ]] && run_args+=(--iam-instance-profile "Name=$INSTANCE_PROFILE_NAME")
+    [[ "$ASSIGN_PUBLIC_IP" == "true" ]] && run_args+=(--associate-public-ip-address)
 
 
     # --------------------------------------------------

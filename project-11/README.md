@@ -103,6 +103,15 @@ export ENV_TYPE=production   # picks ami-scripts/production.sh by default
 ./run.sh ami myapp production create
 ```
 
+**The builder gets a public IP by default** (`--associate-public-ip-address`, on unless
+`ASSIGN_PUBLIC_IP=false`). It has to: `manage_network.sh`'s subnets don't auto-assign public
+IPs and this network has no NAT gateway, so without one the builder would have a route to the
+Internet Gateway but nothing for it to NAT with — outbound package downloads in the
+provisioning script (`curl`, `dnf install`, …) would just hang. It's low-stakes since the
+builder is temporary and terminated right after imaging; set `ASSIGN_PUBLIC_IP=false` only if
+you've set up a NAT gateway instead. The same reasoning applies to `instances`/`instance-ami`
+if their app needs outbound internet access too — neither passes the flag today.
+
 State is keyed by `<name>`/`<env-type>` together (`AMI_MYAPP_PRODUCTION_ID`, same collision-safe
 prefixing as `instances`), so `myapp`/`staging` and `myapp`/`production` coexist in the same
 log without clobbering each other.
