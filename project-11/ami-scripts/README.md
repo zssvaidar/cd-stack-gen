@@ -7,10 +7,22 @@ starting point (installs `cloudflared` — the same install this stack already u
 [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `cloud-init-cloudflared.sh`). Copy
 it to `<env-type>.sh` and replace the body with whatever that environment actually needs.
 
-`egress-gateway.sh` is the other real one in here, used by `run.sh egress` (see the top-level
+`egress-gateway.sh` is another real one in here, used by `run.sh egress` (see the top-level
 README) — it bakes IP forwarding and NAT into the image instead of installing an app, making
 the resulting instance usable as a self-managed NAT instance rather than something you deploy
 code onto.
+
+`nodejs.sh` is a real, runnable app stack: nginx as the front end on `:80`, a Node.js app behind
+it on `127.0.0.1:3000` run as a dedicated `nodeapp` system user via a systemd unit, and a
+build-time smoke test (`curl` through nginx, not just "the config parsed") before the instance
+gets snapshotted. **There's no separate mechanism for "choosing a set of technologies" to
+install** — the script body *is* the choice. `nodejs.sh` happens to install nginx + Node.js;
+copy it to `<env-type>.sh` and swap the `dnf install` line and the app section for whatever
+stack you actually want (Python + gunicorn, a Go binary, …) — same shape, different packages and
+systemd unit(s). The app itself is the same dependency-free app as
+`project-9/containers/node-app`, just run directly on the instance instead of in a container;
+replace the `cat > /opt/app/server.js` block with your own deploy step (copy build output in,
+fetch from S3/git, …) once you have a real one.
 
 **Runs as root.** Packer connects over SSH as `ec2-user`, not root, but `packer/ami.pkr.hcl`'s
 provisioner block wraps the script in `sudo` (`execute_command`) — the same effective privilege

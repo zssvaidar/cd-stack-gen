@@ -112,6 +112,12 @@ export ENV_TYPE=production   # picks ami-scripts/production.sh by default
 ./run.sh ami myapp production create
 ```
 
+"Which technologies get installed" is just "what `ami-scripts/<env-type>.sh` does" — there's no
+separate picker mechanism, the script body is the choice. `ami-scripts/nodejs.sh` is a real,
+runnable example (nginx + Node.js, a systemd unit, a build-time smoke test through the reverse
+proxy) worth copying as a starting point instead of writing one from scratch; see
+`ami-scripts/README.md` for what it does and how to swap in your own stack.
+
 Prerequisites: `packer` and `jq` on PATH (`create` checks for both up front and fails fast with
 an install link if either is missing; `delete` needs neither). Packer generates its own
 ephemeral ed25519 keypair for each build and discards it afterward — the builder's SSH access
