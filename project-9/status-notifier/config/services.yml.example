@@ -1,0 +1,19 @@
+poll_interval_seconds: 30
+request_timeout_seconds: 5
+
+services:
+  # docker deployed via ec2-deploy/Jenkinsfile
+  - name: node-app
+    type: http
+    url: http://<ec2-host>:3000/health
+
+  - name: python-app
+    type: http
+    url: http://<ec2-host>:5000/health
+
+  # deployed via ecs-deploy/Jenkinsfile
+  - name: go-app-ecs
+    type: ecs
+    region: ap-northeast-1
+    cluster: cd-stack-cluster
+    service: go-app-service

@@ -1,0 +1,4 @@
+.env
+config/services.yml
+__pycache__/
+*.pyc

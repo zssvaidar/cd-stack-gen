@@ -1,0 +1,10 @@
+{
+  "name": "node-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal Node.js deploy target for the project-9 CD stack (no external dependencies)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

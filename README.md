@@ -1,4 +1,23 @@
-# project-9 — PHP 8 build/test/deploy, dual web servers, Vault secret injection
+# cd-stack-gen
+
+This repository holds two unrelated projects that ended up sharing one git history after a
+merge — nothing here connects them, they just happen to live in the same repo now:
+
+1. **PHP 8 CD stack** (repo root: `app/`, `docker/`, `scripts/`, `docs/`) — a build/test/deploy
+   pipeline for a PHP 8 app with dual nginx/Apache front ends and Vault secret injection. Its
+   own docs call it "project-9", which is **not** the same thing as this repo's `project-9/`
+   directory below — see [PHP 8 CD stack](#php-8-cd-stack) further down.
+2. **CD Stack Gen** (`project-9/`, `project-10/`, `project-11/`) — continuation of the learning
+   project at [awscli-vault-jenkins-cd-stack](https://github.com/zssvaidar/awscli-vault-jenkins-cd-stack).
+   See [CD Stack Gen](#cd-stack-gen-1) further down.
+
+---
+
+## PHP 8 CD stack
+
+*(originally titled "project-9 — PHP 8 build/test/deploy, dual web servers, Vault secret
+injection" — retitled here only to avoid colliding with the unrelated `project-9/` directory
+below; nothing else changed.)*
 
 Continues this repo's `project-N` series (project-8 is the Jenkins+Vault+AWS-IAM
 plumbing this project's scripts plug into). Scope: a mock Composer project to build
@@ -7,7 +26,7 @@ front ends for the same php-fpm container (either works for a real Laravel app
 unmodified - see below), idempotent build/test/deploy scripts, and Vault-based
 secret injection into the container at start, not bake time.
 
-## Layout
+### Layout
 
 ```
 app/                        mock Composer project (build/test target)
@@ -36,7 +55,7 @@ docs/
   vault-secret-injection.md   the actual answer to "how do I inject Vault secrets into this" + tradeoffs
 ```
 
-## Why both a mock app and "works with real Laravel" throughout
+### Why both a mock app and "works with real Laravel" throughout
 
 The build/test/deploy pipeline needs *something* real to build and test now, without
 waiting on an actual Laravel app existing yet - `app/` is that stand-in: a real
@@ -47,10 +66,9 @@ written so that swapping `app/` for an actual Laravel install (with `artisan`,
 only uncommenting the `storage`/`bootstrap/cache` permission lines called out in
 `docker/php/Dockerfile`.
 
-## Build + test
+### Build + test
 
 ```bash
-cd project-9-php-laravel-cd
 cp .env.example .env                 # everything works with VAULT_* left blank
 
 ./scripts/build.sh                   # composer install/validate + build php/nginx/apache images
@@ -65,7 +83,7 @@ Verified locally in this environment: `composer validate --strict` passes,
 `composer run lint` (`php -l` across every tracked file) passes, and `composer run
 test` runs 5 PHPUnit assertions across 3 tests, all green.
 
-## Run it
+### Run it
 
 ```bash
 docker compose up --build                    # php + nginx on http://localhost:8080
@@ -76,7 +94,7 @@ curl http://localhost:8080/healthz    # nginx's own liveness, bypasses php-fpm
 curl http://localhost:8081/           # same app, through Apache + mod_proxy_fcgi instead
 ```
 
-## Configuring PHP 8
+### Configuring PHP 8
 
 - `PHP_VERSION` build arg (default `8.3`) selects the `php:${PHP_VERSION}-fpm-alpine`
   base for both build and runtime stages - `docker build --build-arg PHP_VERSION=8.2`
@@ -89,7 +107,7 @@ curl http://localhost:8081/           # same app, through Apache + mod_proxy_fcg
 - `opcache.validate_timestamps` flips between the two `docker/php/conf.d/opcache-*.ini`
   files based on `APP_ENV`, handled by `docker-entrypoint.sh` at container start.
 
-## Deploying
+### Deploying
 
 ```bash
 ./scripts/deploy.sh nginx                        # this machine
@@ -104,9 +122,39 @@ list of what it does and doesn't do (e.g. no automatic rollback - portfolio scop
 matches project-8/project-9's siblings in the ecom1 repo) is in `deploy.sh`'s own
 header comment.
 
-## Vault secrets -> container
+### Vault secrets -> container
 
 Short answer: `docker/php/docker-entrypoint.sh` fetches them from Vault at container
 start and exports them into the process the app runs as - never baked into the image,
 never passed as `docker run -e`. Full reasoning, the sidecar alternative, and the ECS
 angle are in [`docs/vault-secret-injection.md`](docs/vault-secret-injection.md).
+
+---
+
+## CD Stack Gen
+
+Continuation of the learning project at
+[awscli-vault-jenkins-cd-stack](https://github.com/zssvaidar/awscli-vault-jenkins-cd-stack)
+(`project-1` … `project-8`: Jenkins controller/agent, Vault-issued short-lived AWS creds,
+IAM role/policy generation). That repo's README lists the remaining TODOs:
+
+- division of jenkins pipeline into deployment scripts
+- configuring ec2, ecs instance
+- service management, alert service down
+- log collector like loki
+- running k8s,k3s on ec2
+
+This picks up where it left off, numbered the same way (`project-9`, …), without touching
+anything in the original repo.
+
+### Projects
+
+- **[project-9](project-9/)** — Jenkins deploy pipelines for EC2 and ECS, sample deploy targets in
+  four languages, and a Telegram bot that reports when a service goes up or down.
+- **[project-10](project-10/)** — AWS security groups: least-privilege rules, SG-to-SG
+  references across a bastion → app → db tier, attaching/detaching them from running
+  instances safely, and auditing for internet-exposed or unused groups.
+- **[project-11](project-11/)** — unified `run.sh` dispatcher (keys, network, ssm, instances,
+  s3, ami, instance-ami, egress) sharing one Purpose-tagged state log — a leaner, single-entry-
+  point alternative to running project-9/project-10's scripts separately, including a
+  Packer-based custom-AMI pipeline and a self-managed NAT-instance egress gateway.
