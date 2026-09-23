@@ -81,6 +81,26 @@ create() {
         echo "      --protocol tcp --port 22 --cidr <your-ip>/32" >&2
     fi
 
+    # a public IP only works if the subnet's own default route goes to the Internet Gateway -
+    # AWS's 1:1 NAT for a public IP has nothing to translate through if 0.0.0.0/0 instead points
+    # at an egress gateway instance (run.sh egress). Easy to hit by accident: TIER defaults to
+    # app, and that's exactly the subnet `run.sh egress` relays through by default.
+    if [[ "$ASSIGN_PUBLIC_IP" == "true" ]]; then
+        DEFAULT_ROUTE_GW=$(aws ec2 describe-route-tables \
+            --region "$AWS_REGION" \
+            --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
+            --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`].GatewayId | [0]' \
+            --output text 2>/dev/null)
+
+        if [[ -z "$DEFAULT_ROUTE_GW" || "$DEFAULT_ROUTE_GW" == "None" || "$DEFAULT_ROUTE_GW" != igw-* ]]; then
+            echo "warning: tier=$TIER's subnet ($SUBNET_ID) default route doesn't go to an Internet" >&2
+            echo "Gateway - it's likely relayed through an egress gateway instance instead. Packer's" >&2
+            echo "SSH connection to the builder's public IP will hang, same as if it had none. Build" >&2
+            echo "in a tier that still routes to the IGW directly, e.g.:" >&2
+            echo "  TIER=bastion run.sh ami $NAME $ENV_TYPE create" >&2
+        fi
+    fi
+
 
     # --------------------------------------------------
     # Build

@@ -143,6 +143,20 @@ hang. It's low-stakes since the builder is temporary and torn down right after i
 to `instances`/`instance-ami` if their app needs outbound internet access too — neither passes
 the flag today.
 
+**A public IP is also useless if the tier's subnet doesn't route straight to the IGW.**
+`TIER` defaults to `app` — which is exactly the subnet `run.sh egress` relays through 0.0.0.0/0
+to a NAT instance by default, once one's been created. AWS's 1:1 NAT for a public IP only works
+if the subnet's own route table sends `0.0.0.0/0` to the Internet Gateway directly; if it's been
+pointed at an egress gateway instead, the builder's public IP is unreachable and Packer's SSH
+connection just hangs, identically to a missing port-22 rule. `create` checks the tier's route
+table and warns (same non-blocking treatment as the port-22 check) if it doesn't find a route to
+an `igw-*` target. Build in a tier that's never relayed instead — `bastion` is the safe default
+once an egress gateway exists:
+
+```bash
+TIER=bastion ./run.sh ami myapp production create
+```
+
 State is keyed by `<name>`/`<env-type>` together (`AMI_MYAPP_PRODUCTION_ID`, same collision-safe
 prefixing as `instances`), so `myapp`/`staging` and `myapp`/`production` coexist in the same
 log without clobbering each other.
