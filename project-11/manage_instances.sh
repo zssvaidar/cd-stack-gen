@@ -20,7 +20,8 @@ case "$TIER" in
     bastion) SUBNET_ID="$BASTION_SUBNET_ID"; SG_ID="$BASTION_SG" ;;
     app)     SUBNET_ID="$APP_SUBNET_ID";     SG_ID="$APP_SG" ;;
     db)      SUBNET_ID="$DB_SUBNET_ID";      SG_ID="$DB_SG" ;;
-    *) echo "error: TIER must be bastion, app or db" >&2; exit 1 ;;
+    egress)  SUBNET_ID="$EGRESS_SUBNET_ID"; SG_ID="$EGRESS_SG" ;;
+    *) echo "error: TIER must be bastion, app, db or egress" >&2; exit 1 ;;
 esac
 
 : "${SUBNET_ID:?no subnet for tier=$TIER in $STATE_FILE - run 'run.sh network create' first}"
