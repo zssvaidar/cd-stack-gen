@@ -10,7 +10,7 @@
 
 source "$STATE_FILE"
 
-[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
+[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress|egress-balancer)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 
 AMI_NAME="${AMI_NAME:-$NAME}"
 TIER="${TIER:-egress}"

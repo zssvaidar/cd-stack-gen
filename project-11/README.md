@@ -1,7 +1,7 @@
-# project-11 — unified run.sh: keys, network, ssm, instances, s3, ami, egress
+# project-11 — unified run.sh: keys, network, ssm, instances, s3, ami, egress, egress-balancer
 
 A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances|s3|
-ami|instance-ami|egress> [args] {create|delete}` sources the matching `manage_*.sh` fragment,
+ami|instance-ami|egress|egress-balancer> [args] {create|delete}` sources the matching `manage_*.sh` fragment,
 all of them sharing one Purpose-tagged state log at `state/$PURPOSE.env`. This is a leaner,
 flatter alternative to `project-9/agent-keys` + `project-10/vpc-network` + `project-10/ssm-manage`
 — same underlying AWS calls, one entry point and one state file instead of four separate ones.
@@ -19,6 +19,8 @@ export PURPOSE=testing
 ./run.sh instance-ami myapp production 2 create   # launch instances from it
 TIER=egress ./run.sh ami gw egress-gateway create   # bake the NAT-instance AMI (see "egress" below)
 ./run.sh egress gw create                  # launch it into its own tier, relay the app tier through it
+TIER=egress ./run.sh ami lb egress-balancer create  # or: NAT + nginx load balancer in one AMI (see below)
+BACKEND_NAME='myapp-production-*' ./run.sh egress-balancer lb create
 ```
 
 Every `create` appends to `state/testing.env` — `keys`/`network`/`ssm` write flat `export`
@@ -251,6 +253,82 @@ finally deletes its security group:
 only exists in `$STATE_FILE` after a fresh `run.sh network create`. A gateway already running
 under the old `TIER=bastion` default keeps working right where it is; there's nothing to
 migrate unless you tear the whole network down and rebuild it.
+
+## `run.sh egress-balancer <name> {create|sync|delete}`
+
+The `egress` NAT instance with an nginx HTTP load balancer on the same box — one public
+instance in the egress tier that both relays the app tier's outbound traffic *and* spreads
+inbound HTTP across the app-tier instances. It's a separate AMI (`ami-scripts/egress-balancer.sh`,
+env-type `egress-balancer`) and a separate manager (`manage_egress_balancer.sh`) rather than a
+flag on `egress`: its own `Role=egress-balancer` tag, SG, route table and `EGRESS_BALANCER_<NAME>_*`
+state keys, so a plain NAT gateway image and a balancer image are baked, launched, replaced and
+torn down independently.
+
+```bash
+TIER=egress ./run.sh ami lb egress-balancer create           # bake it (EGRESS_SG needs port 22 for Packer)
+./run.sh instance-ami myapp production 3 create              # the app instances to balance across
+BACKEND_NAME='myapp-production-*' ./run.sh egress-balancer lb create
+curl http://<public-ip>/lb-health                            # "ok backends=3"
+curl http://<public-ip>/                                     # round-robined across the 3
+
+./run.sh instance-ami myapp production 2 create              # scaled out? re-point without relaunching:
+BACKEND_NAME='myapp-production-*' ./run.sh egress-balancer lb sync
+./run.sh egress-balancer lb delete
+./run.sh ami lb egress-balancer delete                       # the AMI is its own lifecycle
+```
+
+**The image** is `egress-gateway.sh`'s NAT setup verbatim (IP forwarding, RFC1918-only
+forward chain, boot-time systemd unit) plus nginx. The backend list can't be baked in — the app
+instances don't exist at build time and their IPs change on every relaunch — so nginx's config
+is *rendered* on the instance by `/usr/local/sbin/egress-balancer-render.sh` from two plain files:
+`/etc/egress-balancer/backends` (one `host:port` per line) and `/etc/egress-balancer/method`
+(`round_robin`/`least_conn`/`ip_hash`). The render script rejects anything that isn't strictly
+`host:port`, `nginx -t`s the result, rolls back to the previous config on failure, then reloads.
+With no backends it serves a clean `503` rather than failing to start; `/lb-health` is answered
+by nginx itself either way. The Packer build smoke-tests all three states (empty → 503, a local
+throwaway backend → proxied, back to empty) before snapshotting.
+
+`create`:
+1. Resolves backends: `BACKEND_IPS` (space-separated) if set, otherwise every *running* instance
+   in `$VPC_ID` tagged `Purpose=$PURPOSE` with `Name` matching `BACKEND_NAME` (wildcards ok —
+   `instance-ami` names its batch `<name>-<env-type>-<i>`). Neither set is fine: it launches
+   answering 503 until a `sync`.
+2. Creates a dedicated SG: all traffic from the VPC CIDR (NAT relay, same as `egress`) plus
+   `tcp/80` from `LB_INGRESS_CIDR` (default `0.0.0.0/0`). Adds `tcp/$BACKEND_PORT` (default 80)
+   **from that SG** onto `BACKEND_SG` (default `$APP_SG`) — `manage_network.sh`'s tier SGs are
+   empty, so without this the backends would drop the balancer's connections.
+3. Launches from `AMI_<AMI_NAME>_EGRESS_BALANCER_ID` with a public IP and user-data that writes
+   the backend/method files and runs the render script at first boot; disables source/dest check.
+4. Rewires `RELAY_SUBNET_IDS` (default `$APP_SUBNET_ID`) to a new route table pointing at it, exactly
+   like `egress`. `RELAY_SUBNET_IDS=none` skips this for a pure load balancer (e.g. when a plain
+   `egress` gateway already relays the app tier). Running both against the same subnet means the
+   last `create` wins the association.
+
+`sync` re-resolves the backends with the same variables and pushes them to the running
+balancer via `aws ssm send-command` — needs the instance profile from `run.sh ssm create`.
+
+`delete` restores routing and terminates the instance the same way `egress delete` does, then
+revokes every SG rule elsewhere in the account that references the balancer's SG (found by what
+references it now, not by trusting `BACKEND_SG`) before deleting the SG itself — AWS refuses to
+delete an SG that another rule still points at.
+
+| variable          | default                     | used for                                         |
+|-------------------|-----------------------------|--------------------------------------------------|
+| `AMI_NAME`        | `<name>`                    | which `ami ... egress-balancer` build to launch  |
+| `BACKEND_NAME`    | —                           | `Name` tag pattern of instances to balance across |
+| `BACKEND_IPS`     | —                           | explicit private IPs, overrides `BACKEND_NAME`   |
+| `BACKEND_PORT`    | `80`                        | port nginx proxies to on each backend            |
+| `BACKEND_SG`      | `$APP_SG`                   | SG that gets the "from balancer" ingress rule    |
+| `LB_METHOD`       | `round_robin`               | `round_robin` / `least_conn` / `ip_hash`         |
+| `LB_INGRESS_CIDR` | `0.0.0.0/0`                 | who may reach the listener on `:80`              |
+| `RELAY_SUBNET_IDS`| `$APP_SUBNET_ID`            | subnets NAT'd through it; `none` to skip         |
+| `TIER`            | `egress`                    | where the balancer itself is launched            |
+
+Not built: TLS termination (only `:80` — put a cert on it with certbot, or keep Cloudflare in
+front), nginx OSS active health checks (only passive: `max_fails=3 fail_timeout=10s` plus
+`proxy_next_upstream` retrying another backend on connect errors/5xx), and any HA — it's one
+instance, so it's a single point of failure for both ingress and egress, the same trade the
+DIY NAT instance already makes versus a managed ALB + NAT Gateway.
 
 ## Fixed while porting this in
 

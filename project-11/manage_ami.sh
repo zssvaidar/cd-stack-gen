@@ -7,7 +7,7 @@
 
 source "$STATE_FILE"
 
-[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
+[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress|egress-balancer)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 
 ENV_TYPE="${ENV_TYPE:?set ENV_TYPE, e.g. production/staging/dev}"
 PROVISION_SCRIPT="${PROVISION_SCRIPT:-ami-scripts/${ENV_TYPE}.sh}"

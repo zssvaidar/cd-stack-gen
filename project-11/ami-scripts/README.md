@@ -12,6 +12,13 @@ README) — it bakes IP forwarding and NAT into the image instead of installing 
 the resulting instance usable as a self-managed NAT instance rather than something you deploy
 code onto.
 
+`egress-balancer.sh` is the same NAT setup plus nginx as an HTTP load balancer on `:80`, used by
+`run.sh egress-balancer` (see the top-level README). Build it as its own AMI
+(`TIER=egress run.sh ami <name> egress-balancer create`) — the backend list isn't baked in;
+nginx's config is rendered at runtime from `/etc/egress-balancer/backends` by
+`/usr/local/sbin/egress-balancer-render.sh`, which the manager feeds through user-data at launch
+and SSM on `sync`.
+
 `nodejs.sh` is a real, runnable app stack: nginx as the front end on `:80`, a Node.js app behind
 it on `127.0.0.1:3000` run as a dedicated `nodeapp` system user via a systemd unit, and a
 build-time smoke test (`curl` through nginx, not just "the config parsed") before the instance
