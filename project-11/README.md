@@ -10,15 +10,15 @@ flatter alternative to `project-9/agent-keys` + `project-10/vpc-network` + `proj
 cp wrapper/config/.env.example wrapper/config/.env   # fill in the creator credentials, once
 export PURPOSE=testing
 
-./run.sh network create                    # vpc + bastion/app/db security groups + subnets
+./run.sh network create                    # vpc + bastion/app/db/egress security groups + subnets
 ./run.sh keys web-host create              # -> 2026-09-21_web-host, imported to AWS + Vault
 ./run.sh ssm create                        # instance profile wrapping the existing jenkins-role
 ./run.sh instances web 3 create            # 3 instances into the app-tier subnet, using all of the above
 ./run.sh s3 app-data create                # -> testing-app-data-<account-id>, blocked/encrypted/versioned
 ./run.sh ami myapp production create       # bake a custom AMI (see below)
 ./run.sh instance-ami myapp production 2 create   # launch instances from it
-./run.sh ami gw egress-gateway create      # bake the NAT-instance AMI (see "egress" below)
-./run.sh egress gw create                  # launch it, relay the app tier's outbound traffic through it
+TIER=egress ./run.sh ami gw egress-gateway create   # bake the NAT-instance AMI (see "egress" below)
+./run.sh egress gw create                  # launch it into its own tier, relay the app tier through it
 ```
 
 Every `create` appends to `state/testing.env` — `keys`/`network`/`ssm` write flat `export`
@@ -112,13 +112,19 @@ export ENV_TYPE=production   # picks ami-scripts/production.sh by default
 ./run.sh ami myapp production create
 ```
 
+"Which technologies get installed" is just "what `ami-scripts/<env-type>.sh` does" — there's no
+separate picker mechanism, the script body is the choice. `ami-scripts/nodejs.sh` is a real,
+runnable example (nginx + Node.js, a systemd unit, a build-time smoke test through the reverse
+proxy) worth copying as a starting point instead of writing one from scratch; see
+`ami-scripts/README.md` for what it does and how to swap in your own stack.
+
 Prerequisites: `packer` and `jq` on PATH (`create` checks for both up front and fails fast with
 an install link if either is missing; `delete` needs neither). Packer generates its own
 ephemeral ed25519 keypair for each build and discards it afterward — the builder's SSH access
 never depends on, or extends, anything from `run.sh keys`.
 
 **The tier's security group needs an inbound rule for port 22**, since Packer connects over
-plain SSH rather than through SSM — `manage_network.sh` creates all three tiers with zero
+plain SSH rather than through SSM — `manage_network.sh` creates all four tiers with zero
 ingress rules, so this is the most likely first thing to trip up a cold start. `create` checks
 for one and warns (doesn't block, since a broader rule or a different exact match could still
 be fine) if it doesn't find an exact port-22 rule on the tier's SG:
@@ -142,6 +148,20 @@ hang. It's low-stakes since the builder is temporary and torn down right after i
 `ASSIGN_PUBLIC_IP=false` only if you've set up a NAT gateway instead. The same reasoning applies
 to `instances`/`instance-ami` if their app needs outbound internet access too — neither passes
 the flag today.
+
+**A public IP is also useless if the tier's subnet doesn't route straight to the IGW.**
+`TIER` defaults to `app` — which is exactly the subnet `run.sh egress` relays through 0.0.0.0/0
+to a NAT instance by default, once one's been created. AWS's 1:1 NAT for a public IP only works
+if the subnet's own route table sends `0.0.0.0/0` to the Internet Gateway directly; if it's been
+pointed at an egress gateway instead, the builder's public IP is unreachable and Packer's SSH
+connection just hangs, identically to a missing port-22 rule. `create` checks the tier's route
+table and warns (same non-blocking treatment as the port-22 check) if it doesn't find a route to
+an `igw-*` target. Build in a tier that's never relayed instead — `bastion` or `egress` are both
+safe once an egress gateway exists (`RELAY_SUBNET_IDS` only ever defaults to the app subnet):
+
+```bash
+TIER=bastion ./run.sh ami myapp production create
+```
 
 State is keyed by `<name>`/`<env-type>` together (`AMI_MYAPP_PRODUCTION_ID`, same collision-safe
 prefixing as `instances`), so `myapp`/`staging` and `myapp`/`production` coexist in the same
@@ -167,15 +187,21 @@ it built, so cleanup stays plain `aws` CLI, same as the rest of this project.
 
 A small public EC2 instance acting as a self-managed NAT instance — the cheap, DIY version of a
 NAT Gateway. `manage_network.sh`'s app/db subnets have a route to the Internet Gateway already
-(all three tiers share `PUBLIC_RT_ID`) but no public IP and no NAT, so nothing in them can
+(all four tiers share `PUBLIC_RT_ID`) but no public IP and no NAT, so nothing in them can
 actually reach the internet. This fills that gap: private instances keep no public IP of their
 own (e.g. an app instance running its own `cloudflared`, same as `bun-hydrate`) and route their
 outbound traffic through this one relay instead.
 
+`manage_network.sh` gives this its own `egress` tier/subnet/SG, separate from `bastion` — a NAT
+instance and an SSH jump box are different concerns even though both need a public IP, and
+mixing them into one subnet/SG means SSH-access rules and NAT-relay rules end up on the same
+security group. `manage_egress_instance.sh` still creates its own **dedicated** SG per gateway
+instance rather than using the tier-wide `EGRESS_SG` directly — see step 2 below.
+
 ```bash
 export ENV_TYPE=egress-gateway
-./run.sh ami gw egress-gateway create      # bake the NAT-capable AMI - see ami-scripts/README.md
-./run.sh egress gw create                  # launch it and rewire the app subnet at it
+TIER=egress ./run.sh ami gw egress-gateway create   # bake the NAT-capable AMI - see ami-scripts/README.md
+./run.sh egress gw create                            # launch it and rewire the app subnet at it
 ```
 
 `create`:
@@ -184,8 +210,10 @@ export ENV_TYPE=egress-gateway
 2. Creates a dedicated security group allowing all traffic in from the VPC's own CIDR (looked
    up from `$VPC_ID`, not hardcoded) — forwarded traffic hitting this instance's ENI is filtered
    by its security group exactly like traffic addressed to the instance itself, so this has to
-   be broader than the empty per-tier SGs `manage_network.sh` creates.
-3. Launches into `$TIER` (default `bastion`) **with a public IP** — it has to have one, that's
+   be broader than the empty per-tier SGs `manage_network.sh` creates. One dedicated SG per
+   gateway instance instead of sharing the tier-wide `EGRESS_SG` keeps multiple gateways (e.g.
+   different `<name>`s) from being forced onto identical rules.
+3. Launches into `$TIER` (default `egress`) **with a public IP** — it has to have one, that's
    the entire point — then disables source/dest check on it (`modify-instance-attribute
    --no-source-dest-check`), the one EC2-API-level setting that actually makes an instance route
    traffic instead of AWS silently dropping anything not addressed to it, no matter what the OS
@@ -218,6 +246,12 @@ finally deletes its security group:
 ./run.sh egress gw delete
 ```
 
+**The `egress` tier doesn't retrofit onto a network you already ran `network create` on** —
+`manage_network.sh` always builds a brand-new VPC, it isn't incremental, so `EGRESS_SUBNET_ID`
+only exists in `$STATE_FILE` after a fresh `run.sh network create`. A gateway already running
+under the old `TIER=bastion` default keeps working right where it is; there's nothing to
+migrate unless you tear the whole network down and rebuild it.
+
 ## Fixed while porting this in
 
 Two things from the original scripts that only mattered on a cold start / an edge case, not on
@@ -241,8 +275,8 @@ Same ideas, different shape:
 - `project-10/vpc-network` + `project-10/security-groups` ≈ `manage_network.sh` — the
   project-10 version splits public/private subnets across 2 AZs with (optionally) a NAT
   Gateway and wires 3 separate security groups together via `--peer-sg` references;
-  `manage_network.sh` here is flatter: one public subnet per tier, one shared route table, all
-  three security groups created empty (you add rules yourself, e.g. with
+  `manage_network.sh` here is flatter: one public subnet per tier (bastion/app/db/egress), one
+  shared route table, all four security groups created empty (you add rules yourself, e.g. with
   `../project-10/security-groups/scripts/add-rule.sh` if you want the same bastion → app → db
   wiring).
 - `project-10/ssm-manage` ≈ `manage_ssm.sh` — project-10's version creates a dedicated

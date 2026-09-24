@@ -14,10 +14,12 @@ export VPC_ID="$VPC_ID"
 export BASTION_SG="$BASTION_SG"
 export APP_SG="$APP_SG"
 export DB_SG="$DB_SG"
+export EGRESS_SG="$EGRESS_SG"
 
 export BASTION_SUBNET_ID="$BASTION_SUBNET_ID"
 export APP_SUBNET_ID="$APP_SUBNET_ID"
 export DB_SUBNET_ID="$DB_SUBNET_ID"
+export EGRESS_SUBNET_ID="$EGRESS_SUBNET_ID"
 
 export IGW_ID="$IGW_ID"
 export PUBLIC_RT_ID="$PUBLIC_RT_ID"
@@ -25,6 +27,7 @@ export PUBLIC_RT_ID="$PUBLIC_RT_ID"
 export BASTION_ASSOC_ID="$BASTION_ASSOC_ID"
 export APP_ASSOC_ID="$APP_ASSOC_ID"
 export DB_ASSOC_ID="$DB_ASSOC_ID"
+export EGRESS_ASSOC_ID="$EGRESS_ASSOC_ID"
 EOF
 
     echo "State saved to $STATE_FILE"
@@ -80,9 +83,24 @@ create() {
         --query 'GroupId' \
         --output text)
 
+    # not used by manage_egress_instance.sh directly - it creates its own dedicated SG per
+    # gateway instance instead of sharing one tier-wide group. Created here anyway for symmetry
+    # with the other three tiers (every tier gets a subnet+SG pair) and as a fallback for
+    # anything else you might want to launch into this tier by hand.
+    EGRESS_SG=$(aws ec2 create-security-group \
+        --region "$AWS_REGION" \
+        --group-name egress-sg \
+        --description "Egress gateway tier - NAT instances relaying private subnets" \
+        --vpc-id "$VPC_ID" \
+        --tag-specifications \
+        "ResourceType=security-group,Tags=[{Key=Purpose,Value=$Purpose}]" \
+        --query 'GroupId' \
+        --output text)
+
     echo "Bastion SG: $BASTION_SG"
     echo "App SG:     $APP_SG"
     echo "DB SG:      $DB_SG"
+    echo "Egress SG:  $EGRESS_SG"
 
 
     # --------------------------------------------------
@@ -118,9 +136,19 @@ create() {
         --query 'Subnet.SubnetId' \
         --output text)
 
+    EGRESS_SUBNET_ID=$(aws ec2 create-subnet \
+        --region "$AWS_REGION" \
+        --vpc-id "$VPC_ID" \
+        --cidr-block "10.0.4.0/24" \
+        --tag-specifications \
+        "ResourceType=subnet,Tags=[{Key=Purpose,Value=$Purpose},{Key=Tier,Value=egress}]" \
+        --query 'Subnet.SubnetId' \
+        --output text)
+
     echo "Bastion subnet: $BASTION_SUBNET_ID"
     echo "App subnet:     $APP_SUBNET_ID"
     echo "DB subnet:      $DB_SUBNET_ID"
+    echo "Egress subnet:  $EGRESS_SUBNET_ID"
 
 
     # --------------------------------------------------
@@ -185,7 +213,7 @@ create() {
     # Associate Bastion Subnet with Public Route Table
     # --------------------------------------------------
 
-    echo "=== Associating Bastion,App,Db Subnet ==="
+    echo "=== Associating Bastion,App,Db,Egress Subnet ==="
 
     BASTION_ASSOC_ID=$(aws ec2 associate-route-table \
         --region "$AWS_REGION" \
@@ -209,11 +237,19 @@ create() {
         --query 'AssociationId' \
         --output text)
 
+    EGRESS_ASSOC_ID=$(aws ec2 associate-route-table \
+        --region "$AWS_REGION" \
+        --route-table-id "$PUBLIC_RT_ID" \
+        --subnet-id "$EGRESS_SUBNET_ID" \
+        --query 'AssociationId' \
+        --output text)
+
     echo "Association: $BASTION_ASSOC_ID"
 
     echo "Bastion associate subnet: $BASTION_ASSOC_ID"
     echo "App     associate subnet: $APP_ASSOC_ID"
     echo "DB      associate subnet: $DB_ASSOC_ID"
+    echo "Egress  associate subnet: $EGRESS_ASSOC_ID"
 
     # --------------------------------------------------
     # Summary
@@ -227,9 +263,11 @@ create() {
     echo "Bastion SG:       $BASTION_SG"
     echo "App SG:            $APP_SG"
     echo "DB SG:             $DB_SG"
+    echo "Egress SG:         $EGRESS_SG"
     echo "Bastion subnet:   $BASTION_SUBNET_ID"
     echo "App subnet:       $APP_SUBNET_ID"
     echo "DB subnet:        $DB_SUBNET_ID"
+    echo "Egress subnet:    $EGRESS_SUBNET_ID"
     echo "Internet Gateway: $IGW_ID"
     echo "Public RT:        $PUBLIC_RT_ID"
     echo "========================================"

@@ -23,7 +23,8 @@ case "$TIER" in
     bastion) SUBNET_ID="$BASTION_SUBNET_ID"; SG_ID="$BASTION_SG" ;;
     app)     SUBNET_ID="$APP_SUBNET_ID";     SG_ID="$APP_SG" ;;
     db)      SUBNET_ID="$DB_SUBNET_ID";      SG_ID="$DB_SG" ;;
-    *) echo "error: TIER must be bastion, app or db" >&2; exit 1 ;;
+    egress)  SUBNET_ID="$EGRESS_SUBNET_ID"; SG_ID="$EGRESS_SG" ;;
+    *) echo "error: TIER must be bastion, app, db or egress" >&2; exit 1 ;;
 esac
 
 : "${SUBNET_ID:?no subnet for tier=$TIER in $STATE_FILE - run 'run.sh network create' first}"
@@ -79,6 +80,26 @@ create() {
         echo "builder will hang until it times out. Add one first, e.g.:" >&2
         echo "  ../project-10/security-groups/scripts/add-rule.sh --sg $SG_ID --direction ingress \\" >&2
         echo "      --protocol tcp --port 22 --cidr <your-ip>/32" >&2
+    fi
+
+    # a public IP only works if the subnet's own default route goes to the Internet Gateway -
+    # AWS's 1:1 NAT for a public IP has nothing to translate through if 0.0.0.0/0 instead points
+    # at an egress gateway instance (run.sh egress). Easy to hit by accident: TIER defaults to
+    # app, and that's exactly the subnet `run.sh egress` relays through by default.
+    if [[ "$ASSIGN_PUBLIC_IP" == "true" ]]; then
+        DEFAULT_ROUTE_GW=$(aws ec2 describe-route-tables \
+            --region "$AWS_REGION" \
+            --filters "Name=association.subnet-id,Values=$SUBNET_ID" \
+            --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`].GatewayId | [0]' \
+            --output text 2>/dev/null)
+
+        if [[ -z "$DEFAULT_ROUTE_GW" || "$DEFAULT_ROUTE_GW" == "None" || "$DEFAULT_ROUTE_GW" != igw-* ]]; then
+            echo "warning: tier=$TIER's subnet ($SUBNET_ID) default route doesn't go to an Internet" >&2
+            echo "Gateway - it's likely relayed through an egress gateway instance instead. Packer's" >&2
+            echo "SSH connection to the builder's public IP will hang, same as if it had none. Build" >&2
+            echo "in a tier that still routes to the IGW directly, e.g.:" >&2
+            echo "  TIER=bastion run.sh ami $NAME $ENV_TYPE create" >&2
+        fi
     fi
 
 

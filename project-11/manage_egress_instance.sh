@@ -13,7 +13,7 @@ source "$STATE_FILE"
 [[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 
 AMI_NAME="${AMI_NAME:-$NAME}"
-TIER="${TIER:-bastion}"
+TIER="${TIER:-egress}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
 
 # which subnets get their default route pointed at this instance - app only by default. db
@@ -31,7 +31,8 @@ case "$TIER" in
     bastion) SUBNET_ID="$BASTION_SUBNET_ID" ;;
     app)     SUBNET_ID="$APP_SUBNET_ID" ;;
     db)      SUBNET_ID="$DB_SUBNET_ID" ;;
-    *) echo "error: TIER must be bastion, app or db" >&2; exit 1 ;;
+    egress)  SUBNET_ID="$EGRESS_SUBNET_ID" ;;
+    *) echo "error: TIER must be bastion, app, db or egress" >&2; exit 1 ;;
 esac
 
 : "${SUBNET_ID:?no subnet for tier=$TIER in $STATE_FILE - run 'run.sh network create' first}"
