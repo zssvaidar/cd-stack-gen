@@ -32,11 +32,14 @@ else
 fi
 
 # Bun isn't in Amazon Linux's repos - install via the official script rather than adding another
-# external package repo. It lands in $HOME/.bun (root's home during provisioning); symlink it
-# onto PATH so the systemd unit below can reference a stable absolute path regardless of who
-# ends up owning the box later.
-curl -fsSL https://bun.sh/install | bash
-ln -sf /root/.bun/bin/bun /usr/local/bin/bun
+# external package repo. By default it installs to $HOME/.bun, which depends on whether
+# `sudo <script>` (Packer's execute_command - see README.md) happens to set HOME=/root; that
+# isn't guaranteed (needs `always_set_home` in sudoers), and when it doesn't, the install lands
+# under the SSH user's home instead while the rest of this script keeps assuming /root - the
+# systemd unit's ExecStart then points at a binary that was never actually placed there. Pin
+# BUN_INSTALL so the binary lands at a known absolute path regardless of HOME.
+curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
+command -v bun >/dev/null 2>&1 || { echo "bun.sh: bun install did not produce /usr/local/bin/bun" >&2; exit 1; }
 
 
 # --------------------------------------------------

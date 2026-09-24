@@ -1,0 +1,70 @@
+# Local dev / integration-test stack for project-9.
+#
+# Default (`docker compose up --build`): php-fpm + nginx, nginx on :8080.
+# Apache instead of/alongside nginx (`docker compose --profile apache up --build`):
+# also brings up apache on :8081, proxying to the SAME php service - compare
+# both servers side by side against the one app without rebuilding anything.
+#
+# Vault is NOT part of this compose file - point VAULT_ADDR at a real Vault
+# (e.g. project-8/vault-cmd) or leave it unset for local dev without secrets
+# (docker-entrypoint.sh falls back to app/.env, gitignored, if present).
+services:
+  php:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.3}
+    image: project-9-php-app:${PHP_VERSION:-8.3}
+    environment:
+      APP_ENV: ${APP_ENV:-local}
+      # Ambient, non-secret config - fine as a plain compose env var. Real
+      # secrets (DB_PASSWORD, APP_KEY, etc.) come from Vault instead, never
+      # listed here (see docker-entrypoint.sh and docs/vault-secret-injection.md).
+      APP_NAME: ${APP_NAME:-project-9-mock-app}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      VAULT_ROLE_ID: ${VAULT_ROLE_ID:-}
+      VAULT_SECRET_ID: ${VAULT_SECRET_ID:-}
+      VAULT_SECRET_PATH: ${VAULT_SECRET_PATH:-}
+    volumes:
+      # Dev convenience only: reflects source edits without a rebuild. Never
+      # do this in staging/prod - those run the image as built, full stop.
+      - ./app:/var/www/html:${APP_VOLUME_MODE:-delegated}
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "php-fpm: master process"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      php:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:80/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  apache:
+    build:
+      context: .
+      dockerfile: docker/apache/Dockerfile
+    profiles: ["apache"]
+    ports:
+      - "8081:80"
+    depends_on:
+      php:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:80/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
