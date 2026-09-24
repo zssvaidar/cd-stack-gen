@@ -13,6 +13,11 @@
 # gateway never holds a certificate. `sync` re-points it (e.g. after the backend was relaunched
 # and got a new private IP) over SSM, no relaunch needed. For TLS termination and more than one
 # backend, use `run.sh egress-balancer` instead.
+#
+# Optional Cloudflare Tunnel (CLOUDFLARE_TUNNEL_TOKEN set): the token is stored in SSM and the
+# instance runs cloudflared with it - see lib_cloudflare_tunnel.sh. The tunnel's origin (e.g. an
+# app instance's private IP) is set on its public hostname in the Cloudflare dashboard; the
+# gateway reaches the app tier over the VPC like anything else in it.
 
 source "$STATE_FILE"
 
@@ -59,6 +64,9 @@ esac
 HTTPS_REQUESTED=""
 [[ -n "$HTTPS_BACKEND_IP$HTTPS_BACKEND_NAME" ]] && HTTPS_REQUESTED=1
 
+TUNNEL_ROLE=egress-gateway
+source ./lib_cloudflare_tunnel.sh
+
 
 statefile() {
     local var_prefix
@@ -102,12 +110,17 @@ resolve_https_backend() {
     echo "HTTPS passthrough: tcp/443 -> $HTTPS_FORWARD"
 }
 
-# shell snippet that writes the forward target and re-applies the ruleset - shared by user-data
-# (create) and SSM send-command (sync)
-nat_commands() {
-    echo "mkdir -p /etc/egress-gateway"
-    echo "echo '$HTTPS_FORWARD' > /etc/egress-gateway/https-forward"
-    echo "/usr/local/sbin/egress-gateway-nat.sh"
+# shell snippet for the instance - shared by user-data (create) and SSM send-command (sync).
+# Only the parts actually being set are included, so a tunnel-only `sync` doesn't touch
+# passthrough and vice versa.
+gateway_commands() {
+    if [[ -n "$HTTPS_REQUESTED" ]]; then
+        echo "mkdir -p /etc/egress-gateway"
+        echo "echo '$HTTPS_FORWARD' > /etc/egress-gateway/https-forward"
+        echo "/usr/local/sbin/egress-gateway-nat.sh"
+    fi
+    [[ -n "$TUNNEL_PARAM" || ( -n "$TUNNEL_SET" && "$1" != "create" ) ]] && tunnel_commands
+    return 0
 }
 
 # idempotent: the listener on the gateway's own SG, and "from the gateway" on the backend's SG.
@@ -141,6 +154,7 @@ create() {
 
     HTTPS_FORWARD=""
     [[ -n "$HTTPS_REQUESTED" ]] && resolve_https_backend
+    tunnel_prepare
 
     VPC_CIDR=$(aws ec2 describe-vpcs --region "$AWS_REGION" --vpc-ids "$VPC_ID" \
         --query 'Vpcs[0].CidrBlock' --output text)
@@ -184,11 +198,13 @@ create() {
     [[ -n "$DATE_NAME" ]] && run_args+=(--key-name "$DATE_NAME")
     [[ -n "$INSTANCE_PROFILE_NAME" ]] && run_args+=(--iam-instance-profile "Name=$INSTANCE_PROFILE_NAME")
 
-    # only needed for passthrough - without it the image's boot-time unit already applies plain NAT
-    local user_data_file=""
-    if [[ -n "$HTTPS_FORWARD" ]]; then
+    # only needed for passthrough/tunnel - without either the image's boot-time unit already
+    # applies plain NAT and cloudflared stays off
+    local user_data_file="" commands
+    commands=$(gateway_commands create)
+    if [[ -n "$commands" ]]; then
         user_data_file=$(mktemp)
-        { echo "#!/bin/bash"; echo "set -e"; nat_commands; } > "$user_data_file"
+        printf '#!/bin/bash\nset -e\n%s\n' "$commands" > "$user_data_file"
         run_args+=(--user-data "file://$user_data_file")
     fi
 
@@ -275,16 +291,20 @@ create() {
     echo "Private IP:   $PRIVATE_IP"
     echo "Relaying:     $RELAY_SUBNET_IDS"
     [[ -n "$HTTPS_FORWARD" ]] && echo "HTTPS:        https://$PUBLIC_IP/ -> $HTTPS_FORWARD (passthrough, TLS on the backend)"
+    [[ -n "$TUNNEL_PARAM" ]] && echo "Tunnel:       cloudflared, token from $TUNNEL_PARAM - set the origin on the tunnel's public hostname"
     echo "========================================"
 
     statefile
 }
 
-# re-point (or turn off) HTTPS passthrough on the running gateway(s) over SSM - for when the
-# backend was relaunched with a new private IP, or passthrough is being enabled after the fact
-sync_https() {
-    [[ -n "$HTTPS_REQUESTED" ]] || { echo "error: set HTTPS_BACKEND_IP or HTTPS_BACKEND_NAME (or =none to turn passthrough off)" >&2; exit 1; }
-    resolve_https_backend
+# push changes to the running gateway(s) over SSM, no relaunch: re-point (or turn off) HTTPS
+# passthrough after the backend was relaunched with a new private IP, and/or store a new tunnel
+# token (rotation) or turn the tunnel on/off. Only what's passed is changed.
+sync_gateway() {
+    [[ -n "$HTTPS_REQUESTED$TUNNEL_SET" ]] || { echo "error: nothing to sync - set HTTPS_BACKEND_IP/HTTPS_BACKEND_NAME and/or CLOUDFLARE_TUNNEL_TOKEN/CLOUDFLARE_TUNNEL_PARAM (=none to turn either off)" >&2; exit 1; }
+    HTTPS_FORWARD=""
+    [[ -n "$HTTPS_REQUESTED" ]] && resolve_https_backend
+    [[ -n "$TUNNEL_SET" ]] && tunnel_prepare
 
     INSTANCE_IDS=$(aws ec2 describe-instances \
         --region "$AWS_REGION" \
@@ -305,11 +325,11 @@ sync_https() {
     fi
 
     local params cmds=()
-    while IFS= read -r line; do cmds+=("\"$line\""); done < <(nat_commands)
+    while IFS= read -r line; do cmds+=("\"$line\""); done < <(gateway_commands)
     params="{\"commands\":[$(IFS=,; echo "${cmds[*]}")]}"
 
     for instance_id in $INSTANCE_IDS; do
-        echo "=== Pushing https-forward to $instance_id over SSM ==="
+        echo "=== Pushing changes to $instance_id over SSM ==="
 
         COMMAND_ID=$(aws ssm send-command \
             --region "$AWS_REGION" \
@@ -330,7 +350,7 @@ sync_https() {
             --output text
     done
 
-    if [[ -z "$HTTPS_FORWARD" ]]; then
+    if [[ -n "$HTTPS_REQUESTED" && -z "$HTTPS_FORWARD" ]]; then
         echo "note: passthrough is off on the instance; the tcp/443 SG rules stay until 'delete'"
     fi
 }
@@ -344,6 +364,8 @@ delete() {
                    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
         --query 'Reservations[*].Instances[*].InstanceId' \
         --output text)
+
+    tunnel_delete_param
 
     if [[ -z "$INSTANCE_IDS" ]]; then
         echo "no matching egress gateway"
@@ -440,7 +462,7 @@ case "$3" in
         create
         ;;
     sync)
-        sync_https
+        sync_gateway
         ;;
     delete)
         delete

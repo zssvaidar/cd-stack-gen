@@ -12,6 +12,10 @@ README) — it bakes IP forwarding and NAT into the image instead of installing 
 the resulting instance usable as a self-managed NAT instance rather than something you deploy
 code onto. It can also optionally pass inbound tcp/443 through to one backend (nftables DNAT,
 target read from `/etc/egress-gateway/https-forward` at runtime), without holding any cert itself.
+Both `egress-gateway.sh` and `egress-balancer.sh` also install `cloudflared`, switched off. It
+only starts once the manager writes an SSM parameter name to `/etc/cloudflare-tunnel/param`.
+`cloudflare-tunnel.service` fetches the token from Parameter Store at each start, so no token is
+ever baked into an image.
 
 `egress-balancer.sh` is the same NAT setup plus nginx as an HTTP load balancer on `:80`, used by
 `run.sh egress-balancer` (see the top-level README). Build it as its own AMI

@@ -14,6 +14,8 @@
 #   - `sync` re-resolves the backends and pushes them over SSM, no relaunch needed
 #   - optional HTTPS (HTTPS_DOMAINS set): opens :443 too and has the instance get and renew a
 #     Let's Encrypt certificate for those domains - see ami-scripts/egress-balancer.sh
+#   - optional Cloudflare Tunnel (CLOUDFLARE_TUNNEL_TOKEN set): stores the token in SSM and has
+#     the instance run cloudflared with it - see lib_cloudflare_tunnel.sh
 
 source "$STATE_FILE"
 
@@ -67,6 +69,9 @@ HTTPS_PORT=443   # fixed, same as LB_PORT
 for v in HTTPS_REDIRECT HTTPS_STAGING HTTPS_DNS_CHECK; do
     [[ "${!v}" =~ ^(true|false)$ ]] || { echo "error: $v must be true or false" >&2; exit 1; }
 done
+
+TUNNEL_ROLE=egress-balancer
+source ./lib_cloudflare_tunnel.sh
 
 AMI_KEY="AMI_$(echo "${AMI_NAME}_egress_balancer" | tr '-' '_' | tr '[:lower:]' '[:upper:]')"
 AMI_ID_VAR="${AMI_KEY}_ID"
@@ -145,6 +150,11 @@ render_commands() {
     fi
 
     echo "/usr/local/sbin/egress-balancer-cert.sh"
+
+    # last, so a tunnel that can't start (e.g. the instance role can't read the parameter)
+    # never stops the backends/cert from being applied under user-data's `set -e`
+    [[ -n "$all" || -n "$TUNNEL_SET" ]] && tunnel_commands
+    return 0
 }
 
 # idempotent - :443 on the balancer's own SG, for `create` and for HTTPS turned on by a later `sync`
@@ -177,6 +187,7 @@ create() {
     [[ -n "$INSTANCE_PROFILE_NAME" ]] || echo "warning: no INSTANCE_PROFILE_NAME in $STATE_FILE - launching without SSM access, 'sync' won't work (run 'run.sh ssm create' first)"
 
     resolve_backends
+    tunnel_prepare
 
     VPC_CIDR=$(aws ec2 describe-vpcs --region "$AWS_REGION" --vpc-ids "$VPC_ID" \
         --query 'Vpcs[0].CidrBlock' --output text)
@@ -333,6 +344,8 @@ create() {
         [[ "$HTTPS_DNS_CHECK" == "true" ]] && \
         echo "              point DNS at $PUBLIC_IP, then 'run.sh egress-balancer $NAME sync' to request the cert"
     fi
+    [[ -n "$TUNNEL_PARAM" ]] && \
+    echo "Tunnel:       cloudflared, token from $TUNNEL_PARAM - set the public hostname's service to http://localhost:8080"
     echo "========================================"
 
     statefile
@@ -348,6 +361,7 @@ sync_balancer() {
     else
         echo "BACKEND_NAME/BACKEND_IPS not set - leaving the backend list as it is"
     fi
+    [[ -n "$TUNNEL_SET" ]] && tunnel_prepare
 
     INSTANCE_IDS=$(find_instances running)
     [[ -n "$INSTANCE_IDS" ]] || { echo "error: no running egress balancer tagged Purpose=$Purpose, Name=$NAME" >&2; exit 1; }
@@ -474,6 +488,8 @@ delete() {
         echo "Deleting security group: $sg"
         aws ec2 delete-security-group --region "$AWS_REGION" --group-id "$sg"
     done
+
+    tunnel_delete_param
 
     echo "=== Cleanup complete ==="
     echo "note: $STATE_FILE is an append-only log - this balancer's entries stay there for history"

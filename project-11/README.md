@@ -284,6 +284,57 @@ HTTPS_BACKEND_IP=none ./run.sh egress gw sync                       # turn it of
   SG** on `HTTPS_BACKEND_SG` (default `$APP_SG`). `delete` revokes rules that reference the
   gateway's SG before deleting it.
 
+### Cloudflare Tunnel on `egress` / `egress-balancer`
+
+Both AMIs ship `cloudflared`, switched off. Pass a tunnel token once and the manager stores it in
+**SSM Parameter Store as a SecureString**. The instance then fetches it itself every time
+cloudflared starts:
+
+```bash
+read -rs CLOUDFLARE_TUNNEL_TOKEN && export CLOUDFLARE_TUNNEL_TOKEN    # keeps it out of shell history
+
+./run.sh egress-balancer lb create     # or sync on a running one; same for `egress gw`
+# -> stored at /testing/egress-balancer/lb/cloudflare-tunnel-token, cloudflared started
+
+unset CLOUDFLARE_TUNNEL_TOKEN
+CLOUDFLARE_TUNNEL_TOKEN=<new> ./run.sh egress-balancer lb sync       # rotate: overwrite + restart
+CLOUDFLARE_TUNNEL_PARAM=none  ./run.sh egress-balancer lb sync       # stop the tunnel
+CLOUDFLARE_TUNNEL_PARAM=/shared/cf-token ./run.sh egress gw create   # reuse an already-stored token
+```
+
+- **Where the token lives.** It is written to `/<purpose>/<egress-gateway|egress-balancer>/<name>/cloudflare-tunnel-token`
+  (override with `CLOUDFLARE_TUNNEL_PARAM`) via a 0600 temp file, so it never appears in `ps`.
+  The token is kept out of the AMI, the user-data and the SSM command history: the instance only
+  ever receives the parameter's *name*. The instance's
+  `cloudflare-tunnel.service` reads the value with `aws ssm get-parameter --with-decryption` at
+  every start, and hands it to cloudflared as `TUNNEL_TOKEN` in its environment, never on disk
+  and never on a command line. `delete` removes the parameter if it's at the default path. A
+  parameter you named yourself is left alone, since it may be shared.
+- **The instance role must be able to read it.** The instance profile from `run.sh ssm create`
+  wraps `jenkins-role` (project-8), which needs:
+  ```json
+  { "Effect": "Allow", "Action": "ssm:GetParameter",
+    "Resource": "arn:aws:ssm:<region>:<account-id>:parameter/<purpose>/egress-*" }
+  ```
+  It also needs `kms:Decrypt` if you use a customer-managed key rather than the default `aws/ssm`
+  key. If this is missing, `create` still succeeds and the tunnel fails to start. Check with
+  `journalctl -u cloudflare-tunnel` on the box. Whoever runs `run.sh` needs `ssm:PutParameter`
+  and `ssm:DescribeParameters`.
+- **Where traffic goes** is set on the tunnel's public hostname in the Cloudflare dashboard (a
+  token-run tunnel takes its routing from there, not from the instance):
+  - `egress-balancer`: `http://localhost:8080`. That's a loopback-only nginx listener just for
+    the tunnel. It sets the real visitor IP from `CF-Connecting-IP` (trusted only there) and
+    sends `X-Forwarded-Proto: https` to the app. Don't use `:80`: it 301s to https when
+    `HTTPS_DOMAINS` is on, and the tunnel would loop.
+  - `egress`: an app instance directly, e.g. `http://10.0.1.23:80`. The gateway reaches the app
+    tier over the VPC like anything else. The app's SG must allow that port from the gateway's
+    SG (not added automatically).
+- **With a tunnel you don't need public ingress or Let's Encrypt.** Cloudflare terminates HTTPS
+  at its edge, and cloudflared only makes outbound connections. You can leave `HTTPS_DOMAINS`
+  unset and narrow `LB_INGRESS_CIDR`. The public IP stays, because the NAT (and cloudflared
+  itself) needs it for outbound traffic.
+- **Rebuild both AMIs** to get `cloudflared`. Images built before this don't have it.
+
 ## `run.sh egress-balancer <name> {create|sync|delete}`
 
 The `egress` NAT instance with an nginx HTTP load balancer on the same box — one public
@@ -337,7 +388,8 @@ throwaway backend → proxied, back to empty) before snapshotting.
 `sync` pushes changes to the running balancer via `aws ssm send-command`, which needs the instance
 profile from `run.sh ssm create`. It only changes what you pass: the backend list if
 `BACKEND_NAME`/`BACKEND_IPS` is set, the method if `LB_METHOD` is set, the HTTPS settings if
-`HTTPS_DOMAINS` is set. With nothing set it just re-runs the certificate step.
+`HTTPS_DOMAINS` is set, the tunnel if `CLOUDFLARE_TUNNEL_TOKEN`/`CLOUDFLARE_TUNNEL_PARAM` is set.
+With nothing set it just re-runs the certificate step.
 
 ### HTTPS on `egress-balancer`: Let's Encrypt
 
@@ -395,6 +447,8 @@ delete an SG that another rule still points at.
 | `HTTPS_REDIRECT`  | `true`                      | 301 http → https once a cert exists              |
 | `HTTPS_STAGING`   | `false`                     | Let's Encrypt staging CA, for testing            |
 | `HTTPS_DNS_CHECK` | `true`                      | only request once DNS points here                |
+| `CLOUDFLARE_TUNNEL_TOKEN` | —                   | store in SSM + run cloudflared (see above)       |
+| `CLOUDFLARE_TUNNEL_PARAM` | `/<purpose>/egress-balancer/<name>/cloudflare-tunnel-token` | existing parameter, or `none` to stop |
 | `TIER`            | `egress`                    | where the balancer itself is launched            |
 
 Not built: nginx OSS active health checks (only passive: `max_fails=3 fail_timeout=10s` plus
