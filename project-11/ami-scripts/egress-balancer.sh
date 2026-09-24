@@ -5,8 +5,9 @@
 # HTTP across the app-tier instances. manage_egress_balancer.sh launches instances from this AMI
 # and owns everything that's only known at launch time - disabling source/dest check, pointing
 # the relayed subnets at it, and which backend IPs nginx balances across (written by user-data at
-# first boot, re-pushed over SSM by `run.sh egress-balancer <name> sync`). This script only has
-# to make the box *capable* of both; it has no idea yet which backends it'll end up fronting.
+# first boot, re-pushed over SSM by `run.sh egress-balancer <name> sync`) and, if HTTPS is
+# enabled, which domain(s) to get a Let's Encrypt certificate for. This script only has to make
+# the box *capable* of all of it; it has no idea yet which backends or domain it'll end up with.
 # Targets Amazon Linux 2023 - nftables is the default firewall backend there.
 set -e
 
@@ -24,15 +25,25 @@ retry_pkg() {
     done
 }
 
-retry_pkg dnf install -y nftables nginx
+retry_pkg dnf install -y nftables nginx openssl python3-pip
+
+# certbot isn't in Amazon Linux 2023's repos (no EPEL, no snapd) - install it into its own venv,
+# which is certbot's documented pip install path, instead of pulling in a third-party repo
+python3 -m venv /opt/certbot
+/opt/certbot/bin/pip install --quiet --upgrade pip
+/opt/certbot/bin/pip install --quiet certbot
+ln -sf /opt/certbot/bin/certbot /usr/local/bin/certbot
+/usr/local/bin/certbot --version
 
 
 # --------------------------------------------------
-# NAT half - identical to egress-gateway.sh (Packer uploads one provisioner script per build, so
-# it's repeated here rather than shared). See that file for why the interface is resolved at
-# boot and why the forward chain only accepts RFC1918 sources. No input chain is defined, so
-# nothing here filters traffic addressed to the box itself - nginx's :80 is gated by the
-# instance's security group, same as any other instance.
+# NAT half - egress-gateway.sh's NAT setup minus its optional tcp/443 passthrough (this box
+# terminates HTTPS itself in nginx, so 443 must reach nginx, not be DNAT'd elsewhere). Packer
+# uploads one provisioner script per build, so it's repeated here rather than shared. See that
+# file for why the interface is resolved at boot and why the forward chain only accepts RFC1918
+# sources. No input chain is defined, so nothing here filters traffic addressed to the box
+# itself - nginx's :80/:443 are gated by the instance's security group, same as any other
+# instance.
 # --------------------------------------------------
 
 cat > /etc/sysctl.d/99-egress-gateway.conf <<'EOF'
@@ -94,26 +105,37 @@ systemctl enable egress-gateway-nat.service
 # --------------------------------------------------
 # Load balancer half. The backend list can't be baked in - the app instances don't exist yet
 # at build time and their private IPs change every relaunch - so the nginx config is rendered
-# from two plain files instead:
-#   /etc/egress-balancer/backends   one host:port per line (# comments allowed)
-#   /etc/egress-balancer/method     round_robin (default) | least_conn | ip_hash
-# manage_egress_balancer.sh writes both (user-data at launch, SSM send-command on `sync`) and
-# then runs the render script, which validates, swaps the config in, `nginx -t`s it, rolls back
-# on failure, and reloads. An empty backend list is valid: nginx answers 503 instead of failing
-# to start on an upstream block with no servers.
+# from plain files instead:
+#   /etc/egress-balancer/backends    one host:port per line (# comments allowed)
+#   /etc/egress-balancer/method      round_robin (default) | least_conn | ip_hash
+#   /etc/egress-balancer/https.conf  KEY=VALUE lines, HTTPS settings - see the cert script below
+# manage_egress_balancer.sh writes them (user-data at launch, SSM send-command on `sync`) and
+# then runs the cert script, which always finishes by running the render script: validate,
+# swap the config in, `nginx -t`, roll back on failure, reload. An empty backend list is valid:
+# nginx answers 503 instead of failing to start on an upstream block with no servers. The :443
+# server only appears once a certificate actually exists - until then (DNS not pointed here yet,
+# issuance failed) the balancer keeps serving plain HTTP rather than refusing to start.
 # --------------------------------------------------
 
 mkdir -p /etc/egress-balancer
-[[ -f /etc/egress-balancer/backends ]] || echo "# host:port, one per line" > /etc/egress-balancer/backends
-[[ -f /etc/egress-balancer/method ]]   || echo "round_robin" > /etc/egress-balancer/method
+[[ -f /etc/egress-balancer/backends ]]   || echo "# host:port, one per line" > /etc/egress-balancer/backends
+[[ -f /etc/egress-balancer/method ]]     || echo "round_robin" > /etc/egress-balancer/method
+[[ -f /etc/egress-balancer/https.conf ]] || : > /etc/egress-balancer/https.conf
 
 cat > /usr/local/sbin/egress-balancer-render.sh <<'SCRIPT'
 #!/bin/bash
 set -e
 
-BACKENDS_FILE=/etc/egress-balancer/backends
-METHOD_FILE=/etc/egress-balancer/method
+CONF_DIR=/etc/egress-balancer
+BACKENDS_FILE=$CONF_DIR/backends
+METHOD_FILE=$CONF_DIR/method
+HTTPS_FILE=$CONF_DIR/https.conf
+CERT_DIR=/etc/letsencrypt/live/egress-balancer
+ACME_ROOT=/var/www/egress-balancer-acme
 CONF=/etc/nginx/conf.d/egress-balancer.conf
+
+# https.conf is KEY=VALUE written by manage_egress_balancer.sh - parsed, never sourced
+https_get() { sed -n "s/^$1=//p" "$HTTPS_FILE" 2>/dev/null | tail -1; }
 
 METHOD=$(tr -d '[:space:]' < "$METHOD_FILE" 2>/dev/null || true)
 case "${METHOD:-round_robin}" in
@@ -135,13 +157,24 @@ while read -r line; do
     COUNT=$((COUNT + 1))
 done < "$BACKENDS_FILE"
 
+# TLS only when HTTPS is configured *and* a certificate is actually on disk - never render a
+# :443 server pointing at files that aren't there, nginx would refuse the whole config
+DOMAINS=$(https_get DOMAINS)
+REDIRECT=$(https_get REDIRECT)
+TLS=0
+[[ -n "$DOMAINS" && -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" ]] && TLS=1
+
+# nginx workers (not root) serve challenge files out of here - must be world-readable
+mkdir -p "$ACME_ROOT"
+chmod 755 "$ACME_ROOT"
+
 if [[ "$COUNT" -gt 0 ]]; then
     UPSTREAM="upstream egress_balancer_backends {
 $METHOD_LINE
 $SERVERS    keepalive 32;
 }
 "
-    ROOT_LOCATION="        proxy_pass http://egress_balancer_backends;
+    PROXY="        proxy_pass http://egress_balancer_backends;
         proxy_http_version 1.1;
         proxy_set_header Connection \"\";
         proxy_set_header Host \$host;
@@ -152,28 +185,67 @@ $SERVERS    keepalive 32;
         proxy_next_upstream error timeout http_502 http_503 http_504;"
 else
     UPSTREAM=""
-    ROOT_LOCATION="        default_type text/plain;
+    PROXY="        default_type text/plain;
         return 503 \"egress-balancer: no backends configured\\n\";"
+fi
+
+# the balancer's own liveness, answered locally on both listeners - doesn't depend on any backend
+HEALTH="    location = /lb-health {
+        access_log off;
+        default_type text/plain;
+        return 200 \"ok backends=$COUNT https=$TLS\\n\";
+    }"
+
+# :80 always serves the ACME HTTP-01 webroot (issuance and every renewal go through it) and
+# /lb-health; everything else is either proxied or, once TLS is up and REDIRECT isn't false,
+# bounced to https
+if [[ "$TLS" == "1" && "$REDIRECT" != "false" ]]; then
+    HTTP_ROOT="        return 301 https://\$host\$request_uri;"
+else
+    HTTP_ROOT="$PROXY"
+fi
+
+HTTPS_SERVER=""
+if [[ "$TLS" == "1" ]]; then
+    HTTPS_SERVER="
+server {
+    listen 443 ssl default_server;
+    server_name _;
+
+    ssl_certificate     $CERT_DIR/fullchain.pem;
+    ssl_certificate_key $CERT_DIR/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:egress_balancer_tls:10m;
+    ssl_session_timeout 1d;
+
+$HEALTH
+
+    location / {
+$PROXY
+    }
+}"
 fi
 
 NEW=$(mktemp)
 cat > "$NEW" <<NGINX
-# rendered by /usr/local/sbin/egress-balancer-render.sh from $BACKENDS_FILE - edit that, not this
+# rendered by /usr/local/sbin/egress-balancer-render.sh from $CONF_DIR - edit those, not this
 ${UPSTREAM}server {
     listen 80 default_server;
     server_name _;
 
-    # the balancer's own liveness, answered locally - doesn't depend on any backend being up
-    location = /lb-health {
-        access_log off;
+    location ^~ /.well-known/acme-challenge/ {
+        root $ACME_ROOT;
         default_type text/plain;
-        return 200 "ok backends=$COUNT\n";
     }
 
+$HEALTH
+
     location / {
-$ROOT_LOCATION
+$HTTP_ROOT
     }
 }
+$HTTPS_SERVER
 NGINX
 
 BACKUP=""
@@ -190,21 +262,149 @@ fi
 rm -f "$BACKUP"
 
 systemctl reload-or-restart nginx.service
-echo "egress-balancer-render: $COUNT backend(s), method=${METHOD:-round_robin}"
+echo "egress-balancer-render: $COUNT backend(s), method=${METHOD:-round_robin}, https=$TLS"
 SCRIPT
 
 chmod +x /usr/local/sbin/egress-balancer-render.sh
 
+
+# --------------------------------------------------
+# Certificate half - Let's Encrypt via certbot's webroot mode, so nginx keeps serving throughout
+# (no --standalone, which would need :80 to itself). /etc/egress-balancer/https.conf:
+#   DOMAINS=example.com,www.example.com   empty = HTTPS off (plain HTTP only)
+#   EMAIL=ops@example.com                 empty = --register-unsafely-without-email
+#   REDIRECT=true|false                   http -> https once a cert exists (default true)
+#   STAGING=true|false                    Let's Encrypt staging CA, for testing (default false)
+#   DNS_CHECK=true|false                  only ask LE once every domain resolves to this box's
+#                                         public IP (default true); false behind a proxy like
+#                                         Cloudflare, where DNS points at the proxy instead
+# Idempotent - run at first boot (user-data), on every `sync`, and twice a day by a timer:
+# issues when there's no cert or DOMAINS/STAGING changed since the last issuance, otherwise
+# just `certbot renew` (a no-op until 30 days before expiry). Always ends by rendering nginx.
+# The DNS check exists because the public IP isn't known until launch - the first boot usually
+# can't validate yet, and failed validations count against Let's Encrypt's rate limits.
+# --------------------------------------------------
+
+cat > /usr/local/sbin/egress-balancer-cert.sh <<'SCRIPT'
+#!/bin/bash
+set -e
+
+CONF_DIR=/etc/egress-balancer
+HTTPS_FILE=$CONF_DIR/https.conf
+ISSUED_FILE=$CONF_DIR/cert-issued
+CERT_NAME=egress-balancer
+CERT_DIR=/etc/letsencrypt/live/$CERT_NAME
+ACME_ROOT=/var/www/egress-balancer-acme
+CERTBOT=/usr/local/bin/certbot
+RENDER=/usr/local/sbin/egress-balancer-render.sh
+
+https_get() { sed -n "s/^$1=//p" "$HTTPS_FILE" 2>/dev/null | tail -1; }
+
+DOMAINS=$(https_get DOMAINS)
+EMAIL=$(https_get EMAIL)
+STAGING=$(https_get STAGING)
+DNS_CHECK=$(https_get DNS_CHECK)
+
+if [[ -z "$DOMAINS" ]]; then
+    # HTTPS off - any old cert is left on disk (harmless, render ignores it without DOMAINS)
+    exec "$RENDER"
+fi
+
+[[ "$DOMAINS" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || { echo "egress-balancer-cert: invalid DOMAINS '$DOMAINS'" >&2; exit 1; }
+[[ -z "$EMAIL" || "$EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] || { echo "egress-balancer-cert: invalid EMAIL '$EMAIL'" >&2; exit 1; }
+IFS=, read -ra DOMAIN_LIST <<< "$DOMAINS"
+
+WANT="$DOMAINS staging=${STAGING:-false}"
+
+# already have exactly this cert - just renew (certbot decides whether it's due)
+if [[ -s "$CERT_DIR/fullchain.pem" && "$(cat "$ISSUED_FILE" 2>/dev/null)" == "$WANT" ]]; then
+    "$CERTBOT" renew --cert-name "$CERT_NAME" --non-interactive --quiet \
+        --deploy-hook "systemctl reload nginx.service" \
+        || echo "egress-balancer-cert: renew failed - keeping the current certificate" >&2
+    exec "$RENDER"
+fi
+
+if [[ "$DNS_CHECK" != "false" ]]; then
+    TOKEN=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)
+    MY_IP=$(curl -fsS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 || true)
+
+    for d in "${DOMAIN_LIST[@]}"; do
+        if ! getent ahostsv4 "$d" | awk '{print $1}' | grep -qxF "${MY_IP:-unknown}"; then
+            echo "egress-balancer-cert: $d doesn't resolve to this instance's public IP (${MY_IP:-unknown}) yet - not requesting a certificate." >&2
+            echo "egress-balancer-cert: point DNS at it, then 'run.sh egress-balancer <name> sync' (or HTTPS_DNS_CHECK=false behind a proxy)." >&2
+            exec "$RENDER"
+        fi
+    done
+fi
+
+# domains or CA changed since the last issuance - drop the old lineage rather than letting
+# certbot decide it's "not due for renewal yet" and keep serving the wrong names/CA. Render
+# first so nginx never has a config pointing at files that are about to disappear.
+if [[ -d "$CERT_DIR" ]]; then
+    rm -f "$ISSUED_FILE"
+    mv "$HTTPS_FILE" "$HTTPS_FILE.pending"
+    "$RENDER" || true
+    mv "$HTTPS_FILE.pending" "$HTTPS_FILE"
+    "$CERTBOT" delete --cert-name "$CERT_NAME" --non-interactive
+fi
+
+"$RENDER"   # :80 with the ACME webroot must be live before asking for validation
+
+args=(certonly --webroot -w "$ACME_ROOT" --cert-name "$CERT_NAME" --non-interactive --agree-tos
+      --deploy-hook "systemctl reload nginx.service")
+for d in "${DOMAIN_LIST[@]}"; do args+=(-d "$d"); done
+if [[ -n "$EMAIL" ]]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-without-email); fi
+[[ "$STAGING" == "true" ]] && args+=(--staging)
+
+if "$CERTBOT" "${args[@]}"; then
+    echo "$WANT" > "$ISSUED_FILE"
+    echo "egress-balancer-cert: certificate issued for $DOMAINS"
+else
+    echo "egress-balancer-cert: certbot failed - serving plain HTTP until the next attempt" >&2
+fi
+
+exec "$RENDER"
+SCRIPT
+
+chmod +x /usr/local/sbin/egress-balancer-cert.sh
+
+# renewals - certbot installed via pip ships no timer of its own
+cat > /etc/systemd/system/egress-balancer-cert.service <<'EOF'
+[Unit]
+Description=Issue/renew the egress balancer's Let's Encrypt certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/egress-balancer-cert.sh
+EOF
+
+cat > /etc/systemd/system/egress-balancer-cert.timer <<'EOF'
+[Unit]
+Description=Twice-daily egress balancer certificate issue/renew
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=12h
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl enable nginx.service
+systemctl enable egress-balancer-cert.timer
 /usr/local/sbin/egress-balancer-render.sh
 
 
 # --------------------------------------------------
 # Smoke test before snapshotting: with no backends yet, the balancer itself must be up
 # (/lb-health 200) and everything else must be a clean 503, not a connection error. Then render
-# once against a throwaway local backend to prove the proxy path actually works, and put the
-# empty config back so the image boots into the "no backends" state until manage_egress_balancer.sh
-# says otherwise.
+# against a throwaway local backend to prove the proxy path works, over HTTP and - with a
+# self-signed stand-in placed where certbot would put the real cert - over HTTPS plus the
+# http->https redirect. Everything is put back so the image boots into the "no backends, no
+# HTTPS" state until manage_egress_balancer.sh says otherwise.
 # --------------------------------------------------
 
 sleep 1
@@ -227,14 +427,37 @@ echo "127.0.0.1:18080" > /etc/egress-balancer/backends
 /usr/local/sbin/egress-balancer-render.sh
 sleep 1
 
-SMOKE_OK=0
-curl -fsS http://127.0.0.1/ | grep -q 'smoke-backend' && SMOKE_OK=1
+SMOKE_HTTP=0
+curl -fsS http://127.0.0.1/ | grep -q 'smoke-backend' && SMOKE_HTTP=1
+
+SMOKE_CERT_DIR=/etc/letsencrypt/live/egress-balancer
+[[ -e "$SMOKE_CERT_DIR" ]] && { echo "egress-balancer.sh: $SMOKE_CERT_DIR already exists on the builder - refusing to overwrite" >&2; exit 1; }
+mkdir -p "$SMOKE_CERT_DIR"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=smoke.invalid" \
+    -keyout "$SMOKE_CERT_DIR/privkey.pem" -out "$SMOKE_CERT_DIR/fullchain.pem" 2>/dev/null
+echo "DOMAINS=smoke.invalid" > /etc/egress-balancer/https.conf
+/usr/local/sbin/egress-balancer-render.sh
+sleep 1
+
+SMOKE_HTTPS=0
+curl -fsSk https://127.0.0.1/ | grep -q 'smoke-backend' && SMOKE_HTTPS=1
+SMOKE_REDIRECT=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/)
 
 kill "$SMOKE_PID" 2>/dev/null || true
-rm -rf /tmp/egress-balancer-smoke
+rm -rf /tmp/egress-balancer-smoke "$SMOKE_CERT_DIR"
+rmdir /etc/letsencrypt/live /etc/letsencrypt 2>/dev/null || true
+: > /etc/egress-balancer/https.conf
 echo "# host:port, one per line" > /etc/egress-balancer/backends
 /usr/local/sbin/egress-balancer-render.sh
 
-[[ "$SMOKE_OK" == "1" ]] \
+[[ "$SMOKE_HTTP" == "1" ]] \
     && echo "egress-balancer.sh: smoke test passed - request proxied to a backend" \
     || { echo "egress-balancer.sh: smoke test failed - request not proxied to a backend" >&2; exit 1; }
+
+[[ "$SMOKE_HTTPS" == "1" ]] \
+    && echo "egress-balancer.sh: smoke test passed - request proxied over https" \
+    || { echo "egress-balancer.sh: smoke test failed - request not proxied over https" >&2; exit 1; }
+
+[[ "$SMOKE_REDIRECT" == "301" ]] \
+    && echo "egress-balancer.sh: smoke test passed - http redirected to https" \
+    || { echo "egress-balancer.sh: smoke test failed - expected 301 on http with https on, got $SMOKE_REDIRECT" >&2; exit 1; }

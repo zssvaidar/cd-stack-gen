@@ -12,6 +12,8 @@
 #   - opens LB_PORT (80) to LB_INGRESS_CIDR on its own SG, and BACKEND_PORT from its own SG on
 #     BACKEND_SG (default $APP_SG) - the per-tier SGs manage_network.sh creates are empty
 #   - `sync` re-resolves the backends and pushes them over SSM, no relaunch needed
+#   - optional HTTPS (HTTPS_DOMAINS set): opens :443 too and has the instance get and renew a
+#     Let's Encrypt certificate for those domains - see ami-scripts/egress-balancer.sh
 
 source "$STATE_FILE"
 
@@ -30,17 +32,41 @@ RELAY_SUBNET_IDS="${RELAY_SUBNET_IDS:-$APP_SUBNET_ID}"
 # which instances nginx balances across: BACKEND_IPS (space-separated private IPs) wins if set,
 # otherwise every running instance in this VPC tagged Purpose=$Purpose and Name matching
 # BACKEND_NAME (wildcards ok - e.g. 'myapp-production-*' for an `instance-ami myapp production`
-# batch). Neither set is allowed: the balancer comes up answering 503 until a later `sync`.
+# batch). Neither set is allowed on `create`: the balancer comes up answering 503 until a later
+# `sync` with one of them.
 BACKEND_NAME="${BACKEND_NAME:-}"
 BACKEND_IPS="${BACKEND_IPS:-}"
+BACKENDS_SET="${BACKEND_NAME}${BACKEND_IPS}"   # `sync` only rewrites the list when one is given
 BACKEND_PORT="${BACKEND_PORT:-80}"
 BACKEND_SG="${BACKEND_SG:-$APP_SG}"
+LB_METHOD_SET="${LB_METHOD:+1}"   # `sync` only overwrites the method when one is actually given
 LB_METHOD="${LB_METHOD:-round_robin}"
 LB_PORT=80   # fixed - it's what ami-scripts/egress-balancer.sh's nginx listens on
 LB_INGRESS_CIDR="${LB_INGRESS_CIDR:-0.0.0.0/0}"
 
 [[ "$LB_METHOD" =~ ^(round_robin|least_conn|ip_hash)$ ]] || { echo "error: LB_METHOD must be round_robin, least_conn or ip_hash" >&2; exit 1; }
 [[ "$BACKEND_PORT" =~ ^[0-9]+$ ]] || { echo "error: BACKEND_PORT must be a port number" >&2; exit 1; }
+
+# HTTPS - off unless HTTPS_DOMAINS is set (comma-separated; the first is the cert's primary
+# name). The instance requests the certificate itself over HTTP-01, so every domain's DNS has to
+# point at the balancer's public IP first - which isn't known until `create` prints it. Expect
+# to create, point DNS, then `sync` (HTTPS_DOMAINS again) to actually get the cert; until then it
+# serves plain HTTP. `sync` leaves HTTPS settings alone unless HTTPS_DOMAINS is given, and
+# HTTPS_DOMAINS=none turns HTTPS back off.
+HTTPS_DOMAINS="${HTTPS_DOMAINS:-}"
+HTTPS_SET="${HTTPS_DOMAINS:+1}"
+[[ "$HTTPS_DOMAINS" == "none" ]] && HTTPS_DOMAINS=""
+HTTPS_EMAIL="${HTTPS_EMAIL:-}"
+HTTPS_REDIRECT="${HTTPS_REDIRECT:-true}"
+HTTPS_STAGING="${HTTPS_STAGING:-false}"
+HTTPS_DNS_CHECK="${HTTPS_DNS_CHECK:-true}"
+HTTPS_PORT=443   # fixed, same as LB_PORT
+
+[[ -z "$HTTPS_DOMAINS" || "$HTTPS_DOMAINS" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || { echo "error: HTTPS_DOMAINS must be comma-separated domain names" >&2; exit 1; }
+[[ -z "$HTTPS_EMAIL" || "$HTTPS_EMAIL" =~ ^[^[:space:]@\'\"]+@[^[:space:]@\'\"]+$ ]] || { echo "error: HTTPS_EMAIL doesn't look like an email address" >&2; exit 1; }
+for v in HTTPS_REDIRECT HTTPS_STAGING HTTPS_DNS_CHECK; do
+    [[ "${!v}" =~ ^(true|false)$ ]] || { echo "error: $v must be true or false" >&2; exit 1; }
+done
 
 AMI_KEY="AMI_$(echo "${AMI_NAME}_egress_balancer" | tr '-' '_' | tr '[:lower:]' '[:upper:]')"
 AMI_ID_VAR="${AMI_KEY}_ID"
@@ -98,14 +124,38 @@ resolve_backends() {
     fi
 }
 
-# shell snippet that writes the backend/method files and re-renders nginx - shared by user-data
-# (create) and SSM send-command (sync). base64 so the payload survives both transports unquoted.
+# shell snippet that writes the backend/method/https files and then runs the cert script (which
+# issues/renews if HTTPS is on and always finishes by re-rendering nginx) - shared by user-data
+# (`create`: writes everything) and SSM send-command (`sync`: only what's given - backends,
+# method and https settings each stay as they are on the instance unless passed again). base64 so the payload survives both transports unquoted.
 render_commands() {
-    local b64
-    b64=$(printf '%s' "$BACKENDS" | base64 | tr -d '\n')
-    echo "echo '$b64' | base64 -d > /etc/egress-balancer/backends"
-    echo "echo '$LB_METHOD' > /etc/egress-balancer/method"
-    echo "/usr/local/sbin/egress-balancer-render.sh"
+    local all="$1" b64
+
+    if [[ -n "$all" || -n "$BACKENDS_SET" ]]; then
+        b64=$(printf '%s' "$BACKENDS" | base64 | tr -d '\n')
+        echo "echo '$b64' | base64 -d > /etc/egress-balancer/backends"
+    fi
+
+    [[ -n "$all" || -n "$LB_METHOD_SET" ]] && echo "echo '$LB_METHOD' > /etc/egress-balancer/method"
+
+    if [[ -n "$all" || -n "$HTTPS_SET" ]]; then
+        b64=$(printf 'DOMAINS=%s\nEMAIL=%s\nREDIRECT=%s\nSTAGING=%s\nDNS_CHECK=%s\n' \
+            "$HTTPS_DOMAINS" "$HTTPS_EMAIL" "$HTTPS_REDIRECT" "$HTTPS_STAGING" "$HTTPS_DNS_CHECK" | base64 | tr -d '\n')
+        echo "echo '$b64' | base64 -d > /etc/egress-balancer/https.conf"
+    fi
+
+    echo "/usr/local/sbin/egress-balancer-cert.sh"
+}
+
+# idempotent - :443 on the balancer's own SG, for `create` and for HTTPS turned on by a later `sync`
+open_https_ingress() {
+    aws ec2 authorize-security-group-ingress \
+        --region "$AWS_REGION" \
+        --group-id "$1" \
+        --ip-permissions "IpProtocol=tcp,FromPort=$HTTPS_PORT,ToPort=$HTTPS_PORT,IpRanges=[{CidrIp=$LB_INGRESS_CIDR,Description=load balancer https listener}]" \
+        >/dev/null 2>&1 \
+        && echo "Security group $1: tcp/$HTTPS_PORT from $LB_INGRESS_CIDR" \
+        || echo "Security group $1: tcp/$HTTPS_PORT rule already present (or couldn't be added)"
 }
 
 find_instances() {
@@ -156,6 +206,8 @@ create() {
 
     echo "Security group: $SG_ID (all from $VPC_CIDR, tcp/$LB_PORT from $LB_INGRESS_CIDR)"
 
+    [[ -n "$HTTPS_DOMAINS" ]] && open_https_ingress "$SG_ID"
+
     # backends only need to accept the balancer, not the world - referenced by SG id so it keeps
     # working whatever private IP the balancer ends up with
     if [[ -n "$BACKEND_SG" ]]; then
@@ -172,7 +224,7 @@ create() {
     echo "=== Launching $NAME (tier=$TIER) ==="
 
     USER_DATA_FILE=$(mktemp)
-    { echo "#!/bin/bash"; echo "set -e"; render_commands; } > "$USER_DATA_FILE"
+    { echo "#!/bin/bash"; echo "set -e"; render_commands all; } > "$USER_DATA_FILE"
 
     local run_args=(
         --region "$AWS_REGION"
@@ -274,20 +326,43 @@ create() {
     echo "Relaying:     ${RELAY_SUBNET_IDS:-none}"
     echo "LB:           http://$PUBLIC_IP/ -> $(echo $BACKENDS | wc -w) backend(s) on :$BACKEND_PORT ($LB_METHOD)"
     echo "Health:       http://$PUBLIC_IP/lb-health"
+    if [[ -n "$HTTPS_DOMAINS" ]]; then
+        local ca="Let's Encrypt"
+        [[ "$HTTPS_STAGING" == "true" ]] && ca="Let's Encrypt staging"
+        echo "HTTPS:        $HTTPS_DOMAINS ($ca)"
+        [[ "$HTTPS_DNS_CHECK" == "true" ]] && \
+        echo "              point DNS at $PUBLIC_IP, then 'run.sh egress-balancer $NAME sync' to request the cert"
+    fi
     echo "========================================"
 
     statefile
 }
 
-# re-resolve backends and push them to the running balancer(s) over SSM - for when app instances
-# have been added, replaced or removed since `create`, no relaunch needed
-sync_backends() {
-    resolve_backends
+# push changes to the running balancer(s) over SSM, no relaunch needed: re-resolved backends
+# (app instances added/replaced/removed since `create`), a new LB_METHOD, HTTPS turned on/off or
+# its domains changed. With nothing set it still re-runs the cert script - which is how the
+# certificate gets requested once DNS points at the balancer.
+sync_balancer() {
+    if [[ -n "$BACKENDS_SET" ]]; then
+        resolve_backends
+    else
+        echo "BACKEND_NAME/BACKEND_IPS not set - leaving the backend list as it is"
+    fi
 
     INSTANCE_IDS=$(find_instances running)
     [[ -n "$INSTANCE_IDS" ]] || { echo "error: no running egress balancer tagged Purpose=$Purpose, Name=$NAME" >&2; exit 1; }
 
     local params cmds=()
+    if [[ -n "$HTTPS_DOMAINS" ]]; then
+        for sg in $(aws ec2 describe-security-groups \
+            --region "$AWS_REGION" \
+            --filters "Name=tag:Purpose,Values=$Purpose" "Name=tag:Name,Values=$NAME" "Name=tag:Role,Values=egress-balancer" \
+            --query 'SecurityGroups[*].GroupId' \
+            --output text); do
+            open_https_ingress "$sg"
+        done
+    fi
+
     while IFS= read -r line; do cmds+=("\"$line\""); done < <(render_commands)
     params="{\"commands\":[$(IFS=,; echo "${cmds[*]}")]}"
 
@@ -410,7 +485,7 @@ case "$3" in
         create
         ;;
     sync)
-        sync_backends
+        sync_balancer
         ;;
     delete)
         delete

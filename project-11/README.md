@@ -185,7 +185,7 @@ image's metadata (and the snapshot IDs in it) disappears the moment it's deregis
 side is unchanged from before Packer: Packer builds images, it doesn't manage teardown of what
 it built, so cleanup stays plain `aws` CLI, same as the rest of this project.
 
-## `run.sh egress <name> {create|delete}`
+## `run.sh egress <name> {create|sync|delete}`
 
 A small public EC2 instance acting as a self-managed NAT instance — the cheap, DIY version of a
 NAT Gateway. `manage_network.sh`'s app/db subnets have a route to the Internet Gateway already
@@ -254,6 +254,36 @@ only exists in `$STATE_FILE` after a fresh `run.sh network create`. A gateway al
 under the old `TIER=bastion` default keeps working right where it is; there's nothing to
 migrate unless you tear the whole network down and rebuild it.
 
+### HTTPS on `egress`: inbound passthrough
+
+A plain `egress` gateway has no web server — outbound HTTPS from the app tier already works
+through it like any other traffic. What it can optionally do is accept **inbound** HTTPS on its
+public IP and pass the raw TCP stream to one app instance, which terminates TLS itself (its
+own cert, e.g. certbot on the app box or a Cloudflare origin cert). No certificate ever lives on
+the gateway. Set either variable to turn it on:
+
+```bash
+HTTPS_BACKEND_NAME='myapp-production-*' ./run.sh egress gw create   # first running match
+HTTPS_BACKEND_IP=10.0.1.23 ./run.sh egress gw sync                  # re-point after a relaunch
+HTTPS_BACKEND_IP=none ./run.sh egress gw sync                       # turn it off again
+```
+
+- The image's NAT script (`ami-scripts/egress-gateway.sh`) reads `/etc/egress-gateway/https-forward`
+  (`ip:port`) and adds an nftables `dnat` for tcp/443 **addressed to the gateway itself**
+  (`fib daddr type local`). That matters: the relayed app tier's own outbound HTTPS arrives on
+  the same interface with dport 443 and must not be hijacked. An empty file means no prerouting
+  chain at all, the same as before. **Rebuild the AMI** (`TIER=egress ./run.sh ami gw egress-gateway create`)
+  to get this: images baked before it ignore the file.
+- The DNAT'd connection is masqueraded like everything else leaving the box, so the backend
+  replies to the gateway. This works however the backend's subnet routes, but the backend sees the
+  gateway's private IP rather than the client's (there's no `X-Forwarded-For` in a TLS stream).
+  Use `egress-balancer` if you need the client IP or more than one backend.
+- `create` writes the target via user-data. `sync` re-resolves it and pushes it over SSM, which needs
+  `run.sh ssm create`'s instance profile. Both add tcp/443 from `HTTPS_INGRESS_CIDR` (default
+  `0.0.0.0/0`) on the gateway's SG, and tcp/`HTTPS_BACKEND_PORT` (default 443) **from the gateway's
+  SG** on `HTTPS_BACKEND_SG` (default `$APP_SG`). `delete` revokes rules that reference the
+  gateway's SG before deleting it.
+
 ## `run.sh egress-balancer <name> {create|sync|delete}`
 
 The `egress` NAT instance with an nginx HTTP load balancer on the same box — one public
@@ -304,8 +334,46 @@ throwaway backend → proxied, back to empty) before snapshotting.
    `egress` gateway already relays the app tier). Running both against the same subnet means the
    last `create` wins the association.
 
-`sync` re-resolves the backends with the same variables and pushes them to the running
-balancer via `aws ssm send-command` — needs the instance profile from `run.sh ssm create`.
+`sync` pushes changes to the running balancer via `aws ssm send-command`, which needs the instance
+profile from `run.sh ssm create`. It only changes what you pass: the backend list if
+`BACKEND_NAME`/`BACKEND_IPS` is set, the method if `LB_METHOD` is set, the HTTPS settings if
+`HTTPS_DOMAINS` is set. With nothing set it just re-runs the certificate step.
+
+### HTTPS on `egress-balancer`: Let's Encrypt
+
+Set `HTTPS_DOMAINS` and the balancer terminates TLS on :443 with a Let's Encrypt certificate it
+gets and renews itself (certbot, HTTP-01 webroot, so nginx keeps serving throughout):
+
+```bash
+BACKEND_NAME='myapp-production-*' HTTPS_DOMAINS=app.example.com HTTPS_EMAIL=ops@example.com \
+    ./run.sh egress-balancer lb create          # prints the public IP
+# point app.example.com's A record at that IP, then:
+./run.sh egress-balancer lb sync                 # requests the cert, :443 comes up
+curl https://app.example.com/lb-health           # "ok backends=3 https=1"
+```
+
+- **DNS first.** HTTP-01 validation needs every domain to resolve to the balancer, and its
+  public IP only exists once `create` has run. So the first boot normally can't validate. Before
+  asking Let's Encrypt, the instance checks that each domain resolves to its own public IP (from
+  IMDS). If one doesn't, it skips the request and keeps serving plain HTTP, so a failed attempt
+  isn't burned against Let's Encrypt's rate limits. Point DNS, then `sync`. A twice-daily timer on
+  the instance also retries on its own. Behind a proxy like Cloudflare, DNS resolves to the proxy
+  instead, so set `HTTPS_DNS_CHECK=false`.
+- **The public IP isn't stable.** It changes if the instance is stopped and started (not on
+  reboot), and the DNS record would then be stale. Attach an Elastic IP by hand if that matters.
+  This script doesn't manage one.
+- **:443 only appears once a certificate exists.** Until then nginx serves HTTP only, rather than
+  failing to start on missing cert files. After that, :80 answers `/lb-health` and the ACME
+  challenge path and 301-redirects everything else to https (`HTTPS_REDIRECT=false` keeps
+  proxying on :80 too).
+- **Renewal** is `egress-balancer-cert.timer` (twice daily). `certbot renew` is a no-op until 30
+  days before expiry, then nginx reloads with the new cert. Changing `HTTPS_DOMAINS` or
+  `HTTPS_STAGING` on a `sync` deletes the old certificate and issues a new one.
+- `HTTPS_STAGING=true` uses Let's Encrypt's staging CA. Its certs aren't browser-trusted, but its
+  rate limits are far higher, so use it for trial runs.
+- `create`/`sync` with HTTPS on adds tcp/443 from `LB_INGRESS_CIDR` to the balancer's SG. Port
+  80 stays open, since renewals validate over it. `HTTPS_DOMAINS=none` on `sync` turns HTTPS off
+  (serves HTTP only again). The tcp/443 rule stays until `delete`.
 
 `delete` restores routing and terminates the instance the same way `egress delete` does, then
 revokes every SG rule elsewhere in the account that references the balancer's SG (found by what
@@ -322,10 +390,14 @@ delete an SG that another rule still points at.
 | `LB_METHOD`       | `round_robin`               | `round_robin` / `least_conn` / `ip_hash`         |
 | `LB_INGRESS_CIDR` | `0.0.0.0/0`                 | who may reach the listener on `:80`              |
 | `RELAY_SUBNET_IDS`| `$APP_SUBNET_ID`            | subnets NAT'd through it; `none` to skip         |
+| `HTTPS_DOMAINS`   | —                           | comma-separated; enables HTTPS, `none` disables  |
+| `HTTPS_EMAIL`     | —                           | Let's Encrypt account email (expiry notices)     |
+| `HTTPS_REDIRECT`  | `true`                      | 301 http → https once a cert exists              |
+| `HTTPS_STAGING`   | `false`                     | Let's Encrypt staging CA, for testing            |
+| `HTTPS_DNS_CHECK` | `true`                      | only request once DNS points here                |
 | `TIER`            | `egress`                    | where the balancer itself is launched            |
 
-Not built: TLS termination (only `:80` — put a cert on it with certbot, or keep Cloudflare in
-front), nginx OSS active health checks (only passive: `max_fails=3 fail_timeout=10s` plus
+Not built: nginx OSS active health checks (only passive: `max_fails=3 fail_timeout=10s` plus
 `proxy_next_upstream` retrying another backend on connect errors/5xx), and any HA — it's one
 instance, so it's a single point of failure for both ingress and egress, the same trade the
 DIY NAT instance already makes versus a managed ALB + NAT Gateway.
