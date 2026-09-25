@@ -1,6 +1,7 @@
-# Cloudflare Tunnel wiring shared by manage_egress_instance.sh and manage_egress_balancer.sh -
-# sourced by them after $STATE_FILE, not by run.sh directly. Expects $Purpose, $AWS_REGION, $NAME
-# and $TUNNEL_ROLE (egress-gateway / egress-balancer) to already be set.
+# Cloudflare Tunnel wiring shared by manage_egress_instance.sh, manage_egress_balancer.sh and
+# manage_instance_ami.sh - sourced by them after $STATE_FILE, not by run.sh directly. Expects
+# $Purpose, $AWS_REGION, $NAME and $TUNNEL_ROLE (egress-gateway / egress-balancer / app) to
+# already be set; $TUNNEL_NAME (default $NAME) is what the parameter and policy are keyed by.
 #
 # The token is passed once, on the command line, and goes straight into SSM Parameter Store as a
 # SecureString - never into the AMI, user-data or SSM command history. The instance only ever
@@ -9,7 +10,7 @@
 #
 #   CLOUDFLARE_TUNNEL_TOKEN   the token (Zero Trust -> Networks -> Tunnels -> your tunnel ->
 #                             install connector). Stored to CLOUDFLARE_TUNNEL_PARAM, or to
-#                             /$Purpose/$TUNNEL_ROLE/$NAME/cloudflare-tunnel-token by default.
+#                             /$Purpose/$TUNNEL_ROLE/$TUNNEL_NAME/cloudflare-tunnel-token by default.
 #   CLOUDFLARE_TUNNEL_PARAM   use an already-stored parameter instead (no token needed), or
 #                             `none` to stop the tunnel on `sync`.
 #
@@ -25,8 +26,9 @@
 
 CLOUDFLARE_TUNNEL_TOKEN="${CLOUDFLARE_TUNNEL_TOKEN:-}"
 CLOUDFLARE_TUNNEL_PARAM="${CLOUDFLARE_TUNNEL_PARAM:-}"
-TUNNEL_DEFAULT_PARAM="/$Purpose/$TUNNEL_ROLE/$NAME/cloudflare-tunnel-token"
-TUNNEL_POLICY_NAME="cloudflare-tunnel-$Purpose-$TUNNEL_ROLE-$NAME"
+TUNNEL_NAME="${TUNNEL_NAME:-$NAME}"
+TUNNEL_DEFAULT_PARAM="/$Purpose/$TUNNEL_ROLE/$TUNNEL_NAME/cloudflare-tunnel-token"
+TUNNEL_POLICY_NAME="cloudflare-tunnel-$Purpose-$TUNNEL_ROLE-$TUNNEL_NAME"
 
 # set = this run touches the tunnel at all; `sync` leaves it alone otherwise
 TUNNEL_SET="${CLOUDFLARE_TUNNEL_TOKEN}${CLOUDFLARE_TUNNEL_PARAM}"
@@ -83,7 +85,7 @@ tunnel_store_token() {
     else
         # tags can only be set on creation, not together with Overwrite
         printf '{"Name":"%s","Type":"SecureString","Value":"%s","Description":"Cloudflare tunnel token for %s %s","Tags":[{"Key":"Purpose","Value":"%s"},{"Key":"Name","Value":"%s"},{"Key":"Role","Value":"%s"}]}' \
-            "$TUNNEL_PARAM" "$CLOUDFLARE_TUNNEL_TOKEN" "$TUNNEL_ROLE" "$NAME" "$Purpose" "$NAME" "$TUNNEL_ROLE" > "$input"
+            "$TUNNEL_PARAM" "$CLOUDFLARE_TUNNEL_TOKEN" "$TUNNEL_ROLE" "$TUNNEL_NAME" "$Purpose" "$TUNNEL_NAME" "$TUNNEL_ROLE" > "$input"
     fi
 
     aws ssm put-parameter --region "$AWS_REGION" --cli-input-json "file://$input" >/dev/null \

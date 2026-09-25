@@ -1,13 +1,18 @@
 #!/bin/bash
-# Copy this to ami-scripts/<env-type>.sh (or point PROVISION_SCRIPT at your own copy) - a Bun app
-# with a build step that produces static client assets (dist/public/*) alongside the server, the
-# way https://github.com/zssvaidar/bun-hydrate does. No nginx on the instance: Bun itself listens
-# on 0.0.0.0:80 and serves both the built static files and the SSR/API routes. TLS, load
-# balancing and the public entry point belong to the egress-balancer in front of it
-# (`run.sh egress-balancer`, default BACKEND_PORT=80 matches), so a second nginx here would only
-# add a hop. ami-scripts/bun_cloudflared.sh is the same app reached through a Cloudflare Tunnel
-# instead. Swap the placeholder app for a real `bun run build` output; the unit stays as-is.
-# Targets Amazon Linux 2023 (dnf), falls back to Amazon Linux 2 (yum).
+# Same Bun app as ami-scripts/bun.sh (static files + SSR served by Bun itself, no nginx), reached
+# through a Cloudflare Tunnel instead of the egress-balancer: Bun listens on 127.0.0.1:80 only,
+# and cloudflared - running on this same instance - makes an outbound connection to Cloudflare
+# and forwards the tunnel's public hostname to it. Nothing on the instance is reachable from
+# outside, so no inbound security group rule and no public IP are needed for traffic; the app
+# tier still needs outbound internet (the egress gateway/balancer's NAT) for cloudflared.
+#
+# cloudflared is installed but off until `run.sh instance-ami` points it at a tunnel token stored
+# in SSM (CLOUDFLARE_TUNNEL_TOKEN) - the token is never baked into this image. In the Cloudflare
+# dashboard set the tunnel's public hostname service to http://localhost:80. Every instance of a
+# batch runs a connector for the same tunnel, which Cloudflare load-balances across.
+#
+# The app section is kept identical to bun.sh apart from HOST - change both together.
+# Targets Amazon Linux 2023 (dnf).
 set -e
 
 # Amazon Linux's own background jobs (dnf-makecache.timer, SSM inventory collection) can grab
@@ -41,7 +46,7 @@ fi
 # systemd unit's ExecStart then points at a binary that was never actually placed there. Pin
 # BUN_INSTALL so the binary lands at a known absolute path regardless of HOME.
 curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash
-command -v bun >/dev/null 2>&1 || { echo "bun.sh: bun install did not produce /usr/local/bin/bun" >&2; exit 1; }
+command -v bun >/dev/null 2>&1 || { echo "bun_cloudflared.sh: bun install did not produce /usr/local/bin/bun" >&2; exit 1; }
 
 
 # --------------------------------------------------
@@ -124,7 +129,8 @@ EOF
 
 chown -R bunapp:bunapp /opt/app
 
-# :80 without running as root - the capability is all the unprivileged bunapp user gets
+# :80 without running as root - the capability is all the unprivileged bunapp user gets. Bound to
+# loopback: cloudflared on this box is the only thing meant to reach it.
 cat > /etc/systemd/system/bun-app.service <<'EOF'
 [Unit]
 Description=Bun app (project-11 CD stack)
@@ -139,7 +145,7 @@ ExecStart=/usr/local/bin/bun run index.ts
 Restart=on-failure
 RestartSec=2
 Environment=PORT=80
-Environment=HOST=0.0.0.0
+Environment=HOST=127.0.0.1
 Environment=NODE_ENV=production
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -162,13 +168,97 @@ systemctl start bun-app.service
 sleep 2
 
 curl -fsS http://127.0.0.1/hydrate.js | grep -q 'placeholder client bundle' \
-    && echo "bun.sh: smoke test passed - static asset served by bun" \
-    || { echo "bun.sh: smoke test failed - static asset not served" >&2; exit 1; }
+    && echo "bun_cloudflared.sh: smoke test passed - static asset served by bun" \
+    || { echo "bun_cloudflared.sh: smoke test failed - static asset not served" >&2; exit 1; }
 
 curl -fsS http://127.0.0.1/health | grep -q '"status":"ok"' \
-    && echo "bun.sh: smoke test passed - app route answered" \
-    || { echo "bun.sh: smoke test failed - /health not answered" >&2; exit 1; }
+    && echo "bun_cloudflared.sh: smoke test passed - app route answered" \
+    || { echo "bun_cloudflared.sh: smoke test failed - /health not answered" >&2; exit 1; }
 
 [[ "$(curl -s --path-as-is -o /dev/null -w '%{http_code}' 'http://127.0.0.1/../../etc/passwd')" == "404" ]] \
-    && echo "bun.sh: smoke test passed - path traversal refused" \
-    || { echo "bun.sh: smoke test failed - path traversal not refused" >&2; exit 1; }
+    && echo "bun_cloudflared.sh: smoke test passed - path traversal refused" \
+    || { echo "bun_cloudflared.sh: smoke test failed - path traversal not refused" >&2; exit 1; }
+
+
+# --------------------------------------------------
+# Cloudflare Tunnel - installed, but off until the manager points it at a token. The token is
+# never baked in: /etc/cloudflare-tunnel/param holds only an SSM Parameter Store *name*
+# (written by user-data / `sync`), and cloudflare-tunnel-run.sh fetches the SecureString with
+# the instance profile every time cloudflared starts, handing it over as TUNNEL_TOKEN in the
+# process environment - never written to disk, never on a command line. Needs
+# ssm:GetParameter on that parameter (and kms:Decrypt for a customer-managed key).
+# --------------------------------------------------
+
+curl -fsSL https://pkg.cloudflare.com/cloudflared.repo -o /etc/yum.repos.d/cloudflared.repo
+retry_pkg dnf install -y cloudflared
+command -v aws >/dev/null 2>&1 || retry_pkg dnf install -y awscli-2
+
+mkdir -p /etc/cloudflare-tunnel
+[[ -f /etc/cloudflare-tunnel/param ]] || : > /etc/cloudflare-tunnel/param
+
+cat > /usr/local/sbin/cloudflare-tunnel-run.sh <<'SCRIPT'
+#!/bin/bash
+set -e
+
+PARAM=$(tr -d '[:space:]' < /etc/cloudflare-tunnel/param 2>/dev/null || true)
+[[ -n "$PARAM" ]] || { echo "cloudflare-tunnel: no parameter configured" >&2; exit 1; }
+
+IMDS_TOKEN=$(curl -fsS -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')
+REGION=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+
+TUNNEL_TOKEN=$(aws ssm get-parameter --region "$REGION" --name "$PARAM" --with-decryption \
+    --query Parameter.Value --output text) \
+    || { echo "cloudflare-tunnel: can't read $PARAM - does the instance profile allow ssm:GetParameter on it?" >&2; exit 1; }
+export TUNNEL_TOKEN
+
+exec /usr/bin/cloudflared --no-autoupdate tunnel run
+SCRIPT
+
+chmod 700 /usr/local/sbin/cloudflare-tunnel-run.sh
+
+# start/restart or stop cloudflared to match /etc/cloudflare-tunnel/param - what user-data and
+# `sync` call after writing it. A restart re-fetches the token, which is how rotation lands.
+cat > /usr/local/sbin/cloudflare-tunnel.sh <<'SCRIPT'
+#!/bin/bash
+set -e
+
+PARAM=$(tr -d '[:space:]' < /etc/cloudflare-tunnel/param 2>/dev/null || true)
+
+if [[ -z "$PARAM" ]]; then
+    systemctl disable --now cloudflare-tunnel.service >/dev/null 2>&1 || true
+    echo "cloudflare-tunnel: off"
+    exit 0
+fi
+
+systemctl enable cloudflare-tunnel.service >/dev/null 2>&1
+systemctl restart cloudflare-tunnel.service
+sleep 3
+if systemctl is-active --quiet cloudflare-tunnel.service; then
+    echo "cloudflare-tunnel: running (token from $PARAM)"
+else
+    echo "cloudflare-tunnel: failed to start - journalctl -u cloudflare-tunnel" >&2
+    journalctl -u cloudflare-tunnel.service -n 20 --no-pager >&2 || true
+    exit 1
+fi
+SCRIPT
+
+chmod +x /usr/local/sbin/cloudflare-tunnel.sh
+
+cat > /etc/systemd/system/cloudflare-tunnel.service <<'EOF'
+[Unit]
+Description=Cloudflare Tunnel (token from SSM Parameter Store)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/cloudflare-tunnel-run.sh
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+cloudflared --version

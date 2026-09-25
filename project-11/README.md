@@ -184,6 +184,28 @@ rewrite — it only ever reads an `AMI_..._ID` out of state, agnostic to how tha
 ./run.sh instance-ami myapp production 1 delete   # <count> only matters for create
 ```
 
+**Cloudflare Tunnel on app instances.** For an image that ships `cloudflared` switched off
+(`ami-scripts/bun_cloudflared.sh`), pass the tunnel token on `create`, the same way as for
+`egress`/`egress-balancer`:
+
+```bash
+./run.sh ami myapp bun_cloudflared create
+read -rs CLOUDFLARE_TUNNEL_TOKEN && export CLOUDFLARE_TUNNEL_TOKEN
+./run.sh instance-ami myapp bun_cloudflared 2 create
+unset CLOUDFLARE_TUNNEL_TOKEN
+```
+
+This works the same way as the egress tunnel option: `lib_cloudflare_tunnel.sh`. The token is
+stored as a SecureString at `/<purpose>/app/<name>-<env-type>/cloudflare-tunnel-token` (or reuse
+one with `CLOUDFLARE_TUNNEL_PARAM`). The instance role gets an inline read policy for exactly
+that parameter, and each instance receives only the parameter name via user-data. All instances
+of the batch share the token, so each runs a connector for the same tunnel, and Cloudflare
+load-balances across them. `delete` removes the batch's read policy and the default-path
+parameter. Rotating the token means storing a new one and relaunching the batch, since
+`instance-ami` has no `sync`. Passing a token for an image without `cloudflared` (e.g. plain
+`bun.sh`) stores and grants it, but the user-data step then fails on the box. The app itself is
+unaffected.
+
 `ami delete` finds every AMI tagged with that exact `Purpose`/`Name`/`Environment`, deregisters
 each one, and deletes its backing snapshot(s) — looked up *before* deregistering, since an
 image's metadata (and the snapshot IDs in it) disappears the moment it's deregistered. This
