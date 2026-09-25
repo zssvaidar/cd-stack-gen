@@ -385,11 +385,16 @@ chmod +x /usr/local/sbin/egress-balancer-render.sh
 #   DNS_CHECK=true|false                  only ask LE once every domain resolves to this box's
 #                                         public IP (default true); false behind a proxy like
 #                                         Cloudflare, where DNS points at the proxy instead
-# Idempotent - run at first boot (user-data), on every `sync`, and twice a day by a timer:
-# issues when there's no cert or DOMAINS/STAGING changed since the last issuance, otherwise
-# just `certbot renew` (a no-op until 30 days before expiry). Always ends by rendering nginx.
+# Idempotent - run at first boot (user-data), on every `sync`, and every 5 minutes by a timer
+# (--timer): issues when there's no cert or DOMAINS/STAGING changed since the last issuance,
+# otherwise `certbot renew` at most twice a day (a no-op until 30 days before expiry).
 # The DNS check exists because the public IP isn't known until launch - the first boot usually
-# can't validate yet, and failed validations count against Let's Encrypt's rate limits.
+# can't validate yet. The timer is what makes HTTPS hands-free: once DNS points here it gets
+# the cert within ~5 minutes, no `sync` needed. The check is local (DNS + IMDS), so retrying
+# it often costs Let's Encrypt nothing; an actual failed certbot attempt backs the timer off for
+# an hour, since failed validations count against Let's Encrypt's rate limits (5/hour).
+# From user-data/sync it always ends by rendering nginx (backends may have changed); from the
+# timer it only renders when something actually changed, so nginx isn't reloaded every 5 min.
 # --------------------------------------------------
 
 cat > /usr/local/sbin/egress-balancer-cert.sh <<'SCRIPT'
@@ -399,6 +404,8 @@ set -e
 CONF_DIR=/etc/egress-balancer
 HTTPS_FILE=$CONF_DIR/https.conf
 ISSUED_FILE=$CONF_DIR/cert-issued
+RENEWED_STAMP=$CONF_DIR/cert-renew-attempted
+FAILED_STAMP=$CONF_DIR/cert-issue-failed
 CERT_NAME=egress-balancer
 CERT_DIR=/etc/letsencrypt/live/$CERT_NAME
 ACME_ROOT=/var/www/egress-balancer-acme
@@ -407,6 +414,18 @@ RENDER=/usr/local/sbin/egress-balancer-render.sh
 
 https_get() { sed -n "s/^$1=//p" "$HTTPS_FILE" 2>/dev/null | tail -1; }
 
+TIMER=""
+[[ "$1" == "--timer" ]] && TIMER=1
+
+# timer runs with nothing changed exit here; manager-triggered runs always render
+finish() {
+    [[ -n "$TIMER" && "$1" != "changed" ]] && exit 0
+    exec "$RENDER"
+}
+
+# true if $1 is missing or older than $2 minutes
+stale() { [[ ! -f "$1" ]] || [[ -n "$(find "$1" -mmin "+$2" 2>/dev/null)" ]]; }
+
 DOMAINS=$(https_get DOMAINS)
 EMAIL=$(https_get EMAIL)
 STAGING=$(https_get STAGING)
@@ -414,7 +433,7 @@ DNS_CHECK=$(https_get DNS_CHECK)
 
 if [[ -z "$DOMAINS" ]]; then
     # HTTPS off - any old cert is left on disk (harmless, render ignores it without DOMAINS)
-    exec "$RENDER"
+    finish
 fi
 
 [[ "$DOMAINS" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || { echo "egress-balancer-cert: invalid DOMAINS '$DOMAINS'" >&2; exit 1; }
@@ -423,12 +442,21 @@ IFS=, read -ra DOMAIN_LIST <<< "$DOMAINS"
 
 WANT="$DOMAINS staging=${STAGING:-false}"
 
-# already have exactly this cert - just renew (certbot decides whether it's due)
+# already have exactly this cert - just renew, at most twice a day (certbot decides whether it's
+# actually due; its deploy hook reloads nginx if it did renew)
 if [[ -s "$CERT_DIR/fullchain.pem" && "$(cat "$ISSUED_FILE" 2>/dev/null)" == "$WANT" ]]; then
-    "$CERTBOT" renew --cert-name "$CERT_NAME" --non-interactive --quiet \
-        --deploy-hook "systemctl reload nginx.service" \
-        || echo "egress-balancer-cert: renew failed - keeping the current certificate" >&2
-    exec "$RENDER"
+    if stale "$RENEWED_STAMP" 720; then
+        touch "$RENEWED_STAMP"
+        "$CERTBOT" renew --cert-name "$CERT_NAME" --non-interactive --quiet \
+            --deploy-hook "systemctl reload nginx.service" \
+            || echo "egress-balancer-cert: renew failed - keeping the current certificate" >&2
+    fi
+    finish
+fi
+
+# a real certbot attempt failed recently - from the timer, wait an hour before the next one
+if [[ -n "$TIMER" ]] && ! stale "$FAILED_STAMP" 60; then
+    finish
 fi
 
 if [[ "$DNS_CHECK" != "false" ]]; then
@@ -438,8 +466,8 @@ if [[ "$DNS_CHECK" != "false" ]]; then
     for d in "${DOMAIN_LIST[@]}"; do
         if ! getent ahostsv4 "$d" | awk '{print $1}' | grep -qxF "${MY_IP:-unknown}"; then
             echo "egress-balancer-cert: $d doesn't resolve to this instance's public IP (${MY_IP:-unknown}) yet - not requesting a certificate." >&2
-            echo "egress-balancer-cert: point DNS at it, then 'run.sh egress-balancer <name> sync' (or HTTPS_DNS_CHECK=false behind a proxy)." >&2
-            exec "$RENDER"
+            echo "egress-balancer-cert: point DNS at it - retried automatically every 5 minutes (HTTPS_DNS_CHECK=false behind a proxy)." >&2
+            finish
         fi
     done
 fi
@@ -465,12 +493,15 @@ if [[ -n "$EMAIL" ]]; then args+=(-m "$EMAIL"); else args+=(--register-unsafely-
 
 if "$CERTBOT" "${args[@]}"; then
     echo "$WANT" > "$ISSUED_FILE"
+    rm -f "$FAILED_STAMP"
+    touch "$RENEWED_STAMP"
     echo "egress-balancer-cert: certificate issued for $DOMAINS"
 else
-    echo "egress-balancer-cert: certbot failed - serving plain HTTP until the next attempt" >&2
+    touch "$FAILED_STAMP"
+    echo "egress-balancer-cert: certbot failed - serving plain HTTP, next attempt in an hour" >&2
 fi
 
-exec "$RENDER"
+finish changed
 SCRIPT
 
 chmod +x /usr/local/sbin/egress-balancer-cert.sh
@@ -484,17 +515,17 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/egress-balancer-cert.sh
+ExecStart=/usr/local/sbin/egress-balancer-cert.sh --timer
 EOF
 
 cat > /etc/systemd/system/egress-balancer-cert.timer <<'EOF'
 [Unit]
-Description=Twice-daily egress balancer certificate issue/renew
+Description=Egress balancer certificate issue (retried until DNS points here) and renew
 
 [Timer]
-OnBootSec=10min
-OnUnitActiveSec=12h
-RandomizedDelaySec=1h
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30s
 
 [Install]
 WantedBy=timers.target

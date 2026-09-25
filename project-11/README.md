@@ -402,33 +402,39 @@ With nothing set it just re-runs the certificate step.
 
 ### HTTPS on `egress-balancer`: Let's Encrypt
 
-Set `HTTPS_DOMAINS` and the balancer terminates TLS on :443 with a Let's Encrypt certificate it
-gets and renews itself (certbot, HTTP-01 webroot, so nginx keeps serving throughout):
+Set `HTTPS_DOMAINS` on `create` and that's the whole setup. The balancer terminates TLS on
+:443 with a Let's Encrypt certificate it gets and renews itself (certbot, HTTP-01 webroot, so
+nginx keeps serving throughout). There's no second command:
 
 ```bash
 BACKEND_NAME='myapp-production-*' HTTPS_DOMAINS=app.example.com HTTPS_EMAIL=ops@example.com \
-    ./run.sh egress-balancer lb create          # prints the public IP
-# point app.example.com's A record at that IP, then:
-./run.sh egress-balancer lb sync                 # requests the cert, :443 comes up
+    ./run.sh egress-balancer lb create          # prints the Elastic IP to point DNS at
+# point app.example.com's A record at that IP - within ~5 minutes :443 is up on its own
 curl https://app.example.com/lb-health           # "ok backends=3 https=1"
 ```
 
-- **DNS first.** HTTP-01 validation needs every domain to resolve to the balancer, and its
-  public IP only exists once `create` has run. So the first boot normally can't validate. Before
-  asking Let's Encrypt, the instance checks that each domain resolves to its own public IP (from
-  IMDS). If one doesn't, it skips the request and keeps serving plain HTTP, so a failed attempt
-  isn't burned against Let's Encrypt's rate limits. Point DNS, then `sync`. A twice-daily timer on
-  the instance also retries on its own. Behind a proxy like Cloudflare, DNS resolves to the proxy
-  instead, so set `HTTPS_DNS_CHECK=false`.
-- **The public IP isn't stable.** It changes if the instance is stopped and started (not on
-  reboot), and the DNS record would then be stale. Attach an Elastic IP by hand if that matters.
-  This script doesn't manage one.
+- **The instance waits for DNS by itself.** HTTP-01 validation needs every domain to resolve to
+  the balancer. `egress-balancer-cert.timer` checks every 5 minutes whether each domain resolves
+  to the instance's own public IP (from IMDS). That check is local, so it costs no Let's Encrypt
+  calls. As soon as DNS matches, it requests the certificate and switches :443 on. Until then it
+  serves plain HTTP. An actual failed certbot attempt backs the timer off for an hour, because
+  failed validations count against Let's Encrypt's rate limit. `sync` with no variables re-runs
+  it immediately if you don't want to wait. Behind a proxy like Cloudflare, DNS resolves to the
+  proxy instead, so set `HTTPS_DNS_CHECK=false`. It then requests right away, so DNS must
+  already reach the box.
+- **The address is an Elastic IP.** With HTTPS on, `create` attaches an Elastic IP
+  (`ELASTIC_IP`, default `true` when `HTTPS_DOMAINS` is set, `false` otherwise). So the address
+  in DNS survives stop/start, which would change an ordinary public IP. `delete` releases it.
+  With `KEEP_ELASTIC_IP=true` it's kept instead, and the next `create` for the same `<name>`
+  reuses it, so DNS never has to change across a rebuild. It's tagged
+  `Purpose`/`Name`/`Role=egress-balancer` and recorded as `EGRESS_BALANCER_<NAME>_EIP_ALLOC`.
 - **:443 only appears once a certificate exists.** Until then nginx serves HTTP only, rather than
   failing to start on missing cert files. After that, :80 answers `/lb-health` and the ACME
   challenge path and 301-redirects everything else to https (`HTTPS_REDIRECT=false` keeps
   proxying on :80 too).
-- **Renewal** is `egress-balancer-cert.timer` (twice daily). `certbot renew` is a no-op until 30
-  days before expiry, then nginx reloads with the new cert. Changing `HTTPS_DOMAINS` or
+- **Renewal** runs from the same timer, at most twice a day. `certbot renew` is a no-op until 30
+  days before expiry, then nginx reloads with the new cert. When nothing changed, the timer
+  exits without touching nginx. Changing `HTTPS_DOMAINS` or
   `HTTPS_STAGING` on a `sync` deletes the old certificate and issues a new one.
 - `HTTPS_STAGING=true` uses Let's Encrypt's staging CA. Its certs aren't browser-trusted, but its
   rate limits are far higher, so use it for trial runs.
@@ -456,6 +462,8 @@ delete an SG that another rule still points at.
 | `HTTPS_REDIRECT`  | `true`                      | 301 http → https once a cert exists              |
 | `HTTPS_STAGING`   | `false`                     | Let's Encrypt staging CA, for testing            |
 | `HTTPS_DNS_CHECK` | `true`                      | only request once DNS points here                |
+| `ELASTIC_IP`      | `true` with HTTPS, else `false` | attach a stable Elastic IP                   |
+| `KEEP_ELASTIC_IP` | `false`                     | on `delete`, keep the EIP for the next `create`  |
 | `CLOUDFLARE_TUNNEL_TOKEN` | —                   | store in SSM + run cloudflared (see above)       |
 | `CLOUDFLARE_TUNNEL_PARAM` | `/<purpose>/egress-balancer/<name>/cloudflare-tunnel-token` | existing parameter, or `none` to stop |
 | `TIER`            | `egress`                    | where the balancer itself is launched            |
