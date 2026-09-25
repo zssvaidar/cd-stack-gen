@@ -408,7 +408,7 @@ nginx keeps serving throughout). There's no second command:
 
 ```bash
 BACKEND_NAME='myapp-production-*' HTTPS_DOMAINS=app.example.com HTTPS_EMAIL=ops@example.com \
-    ./run.sh egress-balancer lb create          # prints the Elastic IP to point DNS at
+    ./run.sh egress-balancer lb create          # prints the public IP to point DNS at
 # point app.example.com's A record at that IP - within ~5 minutes :443 is up on its own
 curl https://app.example.com/lb-health           # "ok backends=3 https=1"
 ```
@@ -422,12 +422,11 @@ curl https://app.example.com/lb-health           # "ok backends=3 https=1"
   it immediately if you don't want to wait. Behind a proxy like Cloudflare, DNS resolves to the
   proxy instead, so set `HTTPS_DNS_CHECK=false`. It then requests right away, so DNS must
   already reach the box.
-- **The address is an Elastic IP.** With HTTPS on, `create` attaches an Elastic IP
-  (`ELASTIC_IP`, default `true` when `HTTPS_DOMAINS` is set, `false` otherwise). So the address
-  in DNS survives stop/start, which would change an ordinary public IP. `delete` releases it.
-  With `KEEP_ELASTIC_IP=true` it's kept instead, and the next `create` for the same `<name>`
-  reuses it, so DNS never has to change across a rebuild. It's tagged
-  `Purpose`/`Name`/`Role=egress-balancer` and recorded as `EGRESS_BALANCER_<NAME>_EIP_ALLOC`.
+- **The address is the instance's own public IP** (`--associate-public-ip-address`, printed by
+  `create` and recorded as `EGRESS_BALANCER_<NAME>_PUBLIC_IP`). It stays the same across
+  reboots, but a stop/start or a `delete` + `create` gives it a new one. Update the A record when
+  that happens. The instance keeps serving its existing certificate, and for a new
+  instance the timer picks up the cert once DNS points at the new IP.
 - **:443 only appears once a certificate exists.** Until then nginx serves HTTP only, rather than
   failing to start on missing cert files. After that, :80 answers `/lb-health` and the ACME
   challenge path and 301-redirects everything else to https (`HTTPS_REDIRECT=false` keeps
@@ -462,8 +461,6 @@ delete an SG that another rule still points at.
 | `HTTPS_REDIRECT`  | `true`                      | 301 http → https once a cert exists              |
 | `HTTPS_STAGING`   | `false`                     | Let's Encrypt staging CA, for testing            |
 | `HTTPS_DNS_CHECK` | `true`                      | only request once DNS points here                |
-| `ELASTIC_IP`      | `true` with HTTPS, else `false` | attach a stable Elastic IP                   |
-| `KEEP_ELASTIC_IP` | `false`                     | on `delete`, keep the EIP for the next `create`  |
 | `CLOUDFLARE_TUNNEL_TOKEN` | —                   | store in SSM + run cloudflared (see above)       |
 | `CLOUDFLARE_TUNNEL_PARAM` | `/<purpose>/egress-balancer/<name>/cloudflare-tunnel-token` | existing parameter, or `none` to stop |
 | `TIER`            | `egress`                    | where the balancer itself is launched            |

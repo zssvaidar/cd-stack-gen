@@ -53,9 +53,10 @@ LB_INGRESS_CIDR="${LB_INGRESS_CIDR:-0.0.0.0/0}"
 # name). One `create` is all it takes: the instance requests the certificate itself over
 # HTTP-01, retrying every 5 minutes (a local DNS check, no Let's Encrypt calls) until every domain
 # resolves to it, then switches :443 on by itself - no `sync` needed. Serves plain HTTP until
-# then. The address to point DNS at is an Elastic IP (ELASTIC_IP, on by default with HTTPS), so it
-# survives stop/start and, with KEEP_ELASTIC_IP=true, even delete + create. `sync` leaves HTTPS
-# settings alone unless HTTPS_DOMAINS is given, and HTTPS_DOMAINS=none turns HTTPS back off.
+# then. The address to point DNS at is the instance's own public IP (--associate-public-ip-address);
+# it changes on stop/start, after which the instance simply waits again until DNS is updated.
+# `sync` leaves HTTPS settings alone unless HTTPS_DOMAINS is given, and HTTPS_DOMAINS=none turns
+# HTTPS back off.
 HTTPS_DOMAINS="${HTTPS_DOMAINS:-}"
 HTTPS_SET="${HTTPS_DOMAINS:+1}"
 [[ "$HTTPS_DOMAINS" == "none" ]] && HTTPS_DOMAINS=""
@@ -65,14 +66,9 @@ HTTPS_STAGING="${HTTPS_STAGING:-false}"
 HTTPS_DNS_CHECK="${HTTPS_DNS_CHECK:-true}"
 HTTPS_PORT=443   # fixed, same as LB_PORT
 
-# stable public address: allocated (or an earlier one for this <name> reused) and attached on
-# `create`, released on `delete` unless KEEP_ELASTIC_IP=true
-ELASTIC_IP="${ELASTIC_IP:-$([[ -n "$HTTPS_DOMAINS" ]] && echo true || echo false)}"
-KEEP_ELASTIC_IP="${KEEP_ELASTIC_IP:-false}"
-
 [[ -z "$HTTPS_DOMAINS" || "$HTTPS_DOMAINS" =~ ^[A-Za-z0-9.-]+(,[A-Za-z0-9.-]+)*$ ]] || { echo "error: HTTPS_DOMAINS must be comma-separated domain names" >&2; exit 1; }
 [[ -z "$HTTPS_EMAIL" || "$HTTPS_EMAIL" =~ ^[^[:space:]@\'\"]+@[^[:space:]@\'\"]+$ ]] || { echo "error: HTTPS_EMAIL doesn't look like an email address" >&2; exit 1; }
-for v in HTTPS_REDIRECT HTTPS_STAGING HTTPS_DNS_CHECK ELASTIC_IP KEEP_ELASTIC_IP; do
+for v in HTTPS_REDIRECT HTTPS_STAGING HTTPS_DNS_CHECK; do
     [[ "${!v}" =~ ^(true|false)$ ]] || { echo "error: $v must be true or false" >&2; exit 1; }
 done
 
@@ -103,7 +99,6 @@ statefile() {
         echo "export ${VAR_PREFIX}_RT=\"$PRIVATE_RT_ID\""
         echo "export ${VAR_PREFIX}_PUBLIC_IP=\"$PUBLIC_IP\""
         echo "export ${VAR_PREFIX}_PRIVATE_IP=\"$PRIVATE_IP\""
-        echo "export ${VAR_PREFIX}_EIP_ALLOC=\"$EIP_ALLOC\""
     } >> "$STATE_FILE"
 
     echo "State appended to $STATE_FILE"
@@ -173,38 +168,6 @@ open_https_ingress() {
         >/dev/null 2>&1 \
         && echo "Security group $1: tcp/$HTTPS_PORT from $LB_INGRESS_CIDR" \
         || echo "Security group $1: tcp/$HTTPS_PORT rule already present (or couldn't be added)"
-}
-
-# an Elastic IP left behind for this <name> (KEEP_ELASTIC_IP=true on an earlier delete) is reused,
-# so a recreated balancer keeps the address DNS already points at; otherwise a new one is tagged
-# for it. Sets EIP_ALLOC and PUBLIC_IP.
-attach_elastic_ip() {
-    EIP_ALLOC=$(aws ec2 describe-addresses \
-        --region "$AWS_REGION" \
-        --filters "Name=tag:Purpose,Values=$Purpose" "Name=tag:Name,Values=$NAME" "Name=tag:Role,Values=egress-balancer" \
-        --query 'Addresses[?AssociationId==null].AllocationId | [0]' \
-        --output text)
-
-    if [[ -z "$EIP_ALLOC" || "$EIP_ALLOC" == "None" ]]; then
-        EIP_ALLOC=$(aws ec2 allocate-address \
-            --region "$AWS_REGION" \
-            --domain vpc \
-            --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=Purpose,Value=$Purpose},{Key=Name,Value=$NAME},{Key=Role,Value=egress-balancer}]" \
-            --query 'AllocationId' \
-            --output text)
-        echo "Elastic IP: allocated $EIP_ALLOC"
-    else
-        echo "Elastic IP: reusing $EIP_ALLOC"
-    fi
-
-    aws ec2 associate-address \
-        --region "$AWS_REGION" \
-        --instance-id "$INSTANCE_ID" \
-        --allocation-id "$EIP_ALLOC" \
-        >/dev/null
-
-    PUBLIC_IP=$(aws ec2 describe-addresses --region "$AWS_REGION" --allocation-ids "$EIP_ALLOC" \
-        --query 'Addresses[0].PublicIp' --output text)
 }
 
 find_instances() {
@@ -310,11 +273,6 @@ create() {
     PRIVATE_IP=$(aws ec2 describe-instances --region "$AWS_REGION" --instance-ids "$INSTANCE_ID" \
         --query 'Reservations[0].Instances[0].PrivateIpAddress' --output text)
 
-    # the instance's own cert timer reads its public IP from IMDS, which reflects the Elastic IP
-    # as soon as it's attached - nothing on the box needs telling
-    EIP_ALLOC=""
-    [[ "$ELASTIC_IP" == "true" ]] && attach_elastic_ip
-
     echo "$NAME: $INSTANCE_ID  public=$PUBLIC_IP  private=$PRIVATE_IP"
 
 
@@ -376,7 +334,7 @@ create() {
     echo "Egress balancer created"
     echo "========================================"
     echo "Instance:     $INSTANCE_ID"
-    echo "Public IP:    $PUBLIC_IP${EIP_ALLOC:+ (Elastic IP $EIP_ALLOC)}"
+    echo "Public IP:    $PUBLIC_IP"
     echo "Private IP:   $PRIVATE_IP"
     echo "Relaying:     ${RELAY_SUBNET_IDS:-none}"
     echo "LB:           http://$PUBLIC_IP/ -> $(echo $BACKENDS | wc -w) backend(s) on :$BACKEND_PORT ($LB_METHOD)"
@@ -498,19 +456,6 @@ delete() {
 
         echo "waiting for termination..."
         aws ec2 wait instance-terminated --region "$AWS_REGION" --instance-ids "$instance_id"
-    done
-
-    for alloc in $(aws ec2 describe-addresses \
-        --region "$AWS_REGION" \
-        --filters "Name=tag:Purpose,Values=$Purpose" "Name=tag:Name,Values=$NAME" "Name=tag:Role,Values=egress-balancer" \
-        --query 'Addresses[*].AllocationId' \
-        --output text); do
-        if [[ "$KEEP_ELASTIC_IP" == "true" ]]; then
-            echo "Keeping Elastic IP $alloc (KEEP_ELASTIC_IP=true) - the next 'create' for $NAME reuses it"
-        else
-            echo "Releasing Elastic IP: $alloc"
-            aws ec2 release-address --region "$AWS_REGION" --allocation-id "$alloc"
-        fi
     done
 
     echo "=== Deleting security group(s) ==="
