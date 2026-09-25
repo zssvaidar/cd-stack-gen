@@ -125,15 +125,20 @@ an install link if either is missing; `delete` needs neither). Packer generates 
 ephemeral ed25519 keypair for each build and discards it afterward — the builder's SSH access
 never depends on, or extends, anything from `run.sh keys`.
 
-**The tier's security group needs an inbound rule for port 22**, since Packer connects over
-plain SSH rather than through SSM — `manage_network.sh` creates all four tiers with zero
-ingress rules, so this is the most likely first thing to trip up a cold start. `create` checks
-for one and warns (doesn't block, since a broader rule or a different exact match could still
-be fine) if it doesn't find an exact port-22 rule on the tier's SG:
+**SSH to the builder is opened automatically.** Packer connects over plain SSH rather than
+through SSM, and `manage_network.sh` creates all four tiers with zero ingress rules. So by
+default (`BUILD_SG=temporary`) the builder doesn't use the tier's SG at all. Packer creates a
+throwaway SG that allows tcp/22 only from the public IP of the machine running `packer build`
+(`temporary_security_group_source_public_ip`), and deletes it together with the builder. There
+is nothing to open by hand, and the shared tier SGs are never modified.
+
+`BUILD_SG=tier` restores the old behaviour: the builder runs in the tier's own SG, which must
+then already allow port 22. `create` warns if it finds no exact port-22 rule there:
 
 ```bash
+BUILD_SG=tier ./run.sh ami myapp production create
 ../project-10/security-groups/scripts/add-rule.sh --sg <sg-id> --direction ingress \
-    --protocol tcp --port 22 --cidr <your-ip>/32
+    --protocol tcp --port 22 --cidr <your-ip>/32      # only needed with BUILD_SG=tier
 ```
 
 An SSM-only alternative exists (Packer's `ssh_interface = "session_manager"`) that would avoid
@@ -156,8 +161,8 @@ the flag today.
 to a NAT instance by default, once one's been created. AWS's 1:1 NAT for a public IP only works
 if the subnet's own route table sends `0.0.0.0/0` to the Internet Gateway directly; if it's been
 pointed at an egress gateway instead, the builder's public IP is unreachable and Packer's SSH
-connection just hangs, identically to a missing port-22 rule. `create` checks the tier's route
-table and warns (same non-blocking treatment as the port-22 check) if it doesn't find a route to
+connection just hangs. `create` checks the tier's route
+table and warns (non-blocking) if it doesn't find a route to
 an `igw-*` target. Build in a tier that's never relayed instead — `bastion` or `egress` are both
 safe once an egress gateway exists (`RELAY_SUBNET_IDS` only ever defaults to the app subnet):
 
@@ -310,16 +315,20 @@ CLOUDFLARE_TUNNEL_PARAM=/shared/cf-token ./run.sh egress gw create   # reuse an 
   every start, and hands it to cloudflared as `TUNNEL_TOKEN` in its environment, never on disk
   and never on a command line. `delete` removes the parameter if it's at the default path. A
   parameter you named yourself is left alone, since it may be shared.
-- **The instance role must be able to read it.** The instance profile from `run.sh ssm create`
-  wraps `jenkins-role` (project-8), which needs:
-  ```json
-  { "Effect": "Allow", "Action": "ssm:GetParameter",
-    "Resource": "arn:aws:ssm:<region>:<account-id>:parameter/<purpose>/egress-*" }
-  ```
-  It also needs `kms:Decrypt` if you use a customer-managed key rather than the default `aws/ssm`
-  key. If this is missing, `create` still succeeds and the tunnel fails to start. Check with
-  `journalctl -u cloudflare-tunnel` on the box. Whoever runs `run.sh` needs `ssm:PutParameter`
-  and `ssm:DescribeParameters`.
+- **Read access is granted automatically.** On every `create`/`sync` that sets a tunnel, the
+  manager attaches an inline policy to the role behind the instance profile (`jenkins-role` by
+  default, looked up from the profile itself). The policy allows `ssm:GetParameter` on exactly
+  that one parameter's ARN and nothing wider. It's named `cloudflare-tunnel-<purpose>-<egress-gateway|egress-balancer>-<name>`,
+  so each gateway or balancer has its own. Re-running it is harmless (`put-role-policy`
+  overwrites). It is re-pointed when `CLOUDFLARE_TUNNEL_PARAM` changes, and removed by
+  `CLOUDFLARE_TUNNEL_PARAM=none`, by that instance's `delete`, and by `run.sh ssm delete`
+  (which removes only this Purpose's `cloudflare-tunnel-*` policies, never the shared role).
+  Without an instance profile, `create`/`sync` refuses before storing anything. The default
+  `aws/ssm` key needs no KMS grant. A parameter you encrypted yourself with a customer-managed
+  key also needs `kms:Decrypt` on that key, which isn't added for you. IAM changes can take a
+  few seconds to apply, so the tunnel service retries every 10s until they do. Whoever runs
+  `run.sh` needs `ssm:PutParameter`, `ssm:DescribeParameters`, `iam:GetInstanceProfile`,
+  `iam:PutRolePolicy` and `iam:DeleteRolePolicy`.
 - **Where traffic goes** is set on the tunnel's public hostname in the Cloudflare dashboard (a
   token-run tunnel takes its routing from there, not from the instance):
   - `egress-balancer`: `http://localhost:8080`. That's a loopback-only nginx listener just for
@@ -346,7 +355,7 @@ state keys, so a plain NAT gateway image and a balancer image are baked, launche
 torn down independently.
 
 ```bash
-TIER=egress ./run.sh ami lb egress-balancer create           # bake it (EGRESS_SG needs port 22 for Packer)
+TIER=egress ./run.sh ami lb egress-balancer create           # bake it (Packer opens SSH itself)
 ./run.sh instance-ami myapp production 3 create              # the app instances to balance across
 BACKEND_NAME='myapp-production-*' ./run.sh egress-balancer lb create
 curl http://<public-ip>/lb-health                            # "ok backends=3"
