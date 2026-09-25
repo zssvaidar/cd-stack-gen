@@ -416,6 +416,18 @@ throwaway backend → proxied, back to empty) before snapshotting.
    `egress` gateway already relays the app tier). Running both against the same subnet means the
    last `create` wins the association.
 
+To change the backend port (e.g. a Bun app on 3000 instead of 80), pass it on `sync` together
+with the backends. `sync` also opens that port on `BACKEND_SG` for the balancer, so no
+security-group edits are needed by hand:
+
+```bash
+BACKEND_NAME='myapp-bun-*' BACKEND_PORT=3000 ./run.sh egress-balancer lb sync
+```
+
+Editing `/etc/egress-balancer/backends` on the box does nothing until
+`/usr/local/sbin/egress-balancer-render.sh` runs. Restarting nginx alone keeps the old config.
+The next `sync` with `BACKEND_NAME`/`BACKEND_IPS` overwrites a hand edit anyway.
+
 `sync` pushes changes to the running balancer via `aws ssm send-command`, which needs the instance
 profile from `run.sh ssm create`. It only changes what you pass: the backend list if
 `BACKEND_NAME`/`BACKEND_IPS` is set, the method if `LB_METHOD` is set, the HTTPS settings if
