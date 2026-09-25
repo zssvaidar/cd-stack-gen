@@ -7,7 +7,7 @@
 
 source "$STATE_FILE"
 
-[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
+[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress|egress-balancer)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 
 ENV_TYPE="${ENV_TYPE:?set ENV_TYPE, e.g. production/staging/dev}"
 PROVISION_SCRIPT="${PROVISION_SCRIPT:-ami-scripts/${ENV_TYPE}.sh}"
@@ -15,6 +15,12 @@ TIER="${TIER:-app}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-t3.micro}"
 BASE_AMI_ID="${BASE_AMI_ID:-}"
 ASSIGN_PUBLIC_IP="${ASSIGN_PUBLIC_IP:-true}"
+
+# how Packer reaches the builder over SSH: `temporary` (default) - Packer creates a throwaway SG
+# allowing tcp/22 only from this machine's public IP and deletes it with the builder, nothing
+# to set up by hand; `tier` - reuse the tier's own SG, which must already allow port 22.
+BUILD_SG="${BUILD_SG:-temporary}"
+[[ "$BUILD_SG" =~ ^(temporary|tier)$ ]] || { echo "error: BUILD_SG must be temporary or tier" >&2; exit 1; }
 
 PACKER_DIR="packer"
 MANIFEST_FILE="$PACKER_DIR/packer-manifest.json"
@@ -62,24 +68,31 @@ create() {
 
 
     # --------------------------------------------------
-    # Preflight: Packer connects over plain SSH, so the chosen tier's security group needs
-    # to actually allow it in - manage_network.sh creates all three tiers with zero rules,
-    # so this is very likely the first thing to trip someone up. Warn, don't block - there
-    # are legitimate reasons this check could be wrong (a broader rule that isn't an exact
-    # port-22 match, SSH allowed by a different mechanism entirely).
+    # Preflight (BUILD_SG=tier only): Packer connects over plain SSH, so the tier's security
+    # group needs to actually allow it in - manage_network.sh creates all tiers with zero
+    # rules. Warn, don't block - a broader rule that isn't an exact port-22 match could still
+    # be fine. The default BUILD_SG=temporary sidesteps this entirely.
     # --------------------------------------------------
 
-    SSH_RULE_COUNT=$(aws ec2 describe-security-group-rules \
-        --region "$AWS_REGION" \
-        --filters "Name=group-id,Values=$SG_ID" \
-        --query "length(SecurityGroupRules[?IsEgress==\`false\` && FromPort==\`22\`])" \
-        --output text 2>/dev/null)
+    local build_sg_id=""
+    if [[ "$BUILD_SG" == "tier" ]]; then
+        build_sg_id="$SG_ID"
+        SSH_RULE_COUNT=$(aws ec2 describe-security-group-rules \
+            --region "$AWS_REGION" \
+            --filters "Name=group-id,Values=$SG_ID" \
+            --query "length(SecurityGroupRules[?IsEgress==\`false\` && FromPort==\`22\`])" \
+            --output text 2>/dev/null)
+    else
+        echo "BUILD_SG=temporary - Packer will open tcp/22 to this machine's public IP on a throwaway SG"
+        SSH_RULE_COUNT=""
+    fi
 
     if [[ "$SSH_RULE_COUNT" == "0" ]]; then
         echo "warning: $SG_ID has no inbound rule for port 22 - Packer's SSH connection to the" >&2
         echo "builder will hang until it times out. Add one first, e.g.:" >&2
         echo "  ../project-10/security-groups/scripts/add-rule.sh --sg $SG_ID --direction ingress \\" >&2
         echo "      --protocol tcp --port 22 --cidr <your-ip>/32" >&2
+        echo "or drop BUILD_SG=tier and let Packer use a temporary SG." >&2
     fi
 
     # a public IP only works if the subnet's own default route goes to the Internet Gateway -
@@ -115,7 +128,7 @@ create() {
         -var "provision_script=$(cd "$(dirname "$PROVISION_SCRIPT")" && pwd)/$(basename "$PROVISION_SCRIPT")"
         -var "base_ami_id=$BASE_AMI_ID"
         -var "subnet_id=$SUBNET_ID"
-        -var "security_group_id=$SG_ID"
+        -var "security_group_id=$build_sg_id"
         -var "instance_type=$INSTANCE_TYPE"
         -var "assign_public_ip=$ASSIGN_PUBLIC_IP"
         -var "instance_profile_name=$INSTANCE_PROFILE_NAME"

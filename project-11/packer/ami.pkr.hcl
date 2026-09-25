@@ -33,8 +33,14 @@ source "amazon-ebs" "ami" {
   # manage_instance_ami.sh for real deploys, not just kept as a build artifact
   encrypt_boot = true
 
-  subnet_id                   = var.subnet_id
-  security_group_id           = var.security_group_id
+  subnet_id = var.subnet_id
+
+  # no security_group_id (manage_ami.sh's default, BUILD_SG=temporary): Packer creates its own
+  # temporary SG allowing tcp/22 only from the public IP of the machine running `packer build`,
+  # and deletes it with the builder - no manual port-22 rule, and the shared tier SGs are never
+  # touched. A given security_group_id (BUILD_SG=tier) is used as-is instead.
+  security_group_id                         = var.security_group_id != "" ? var.security_group_id : null
+  temporary_security_group_source_public_ip = var.security_group_id == ""
   associate_public_ip_address = var.assign_public_ip
   iam_instance_profile        = var.instance_profile_name != "" ? var.instance_profile_name : null
 

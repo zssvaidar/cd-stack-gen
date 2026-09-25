@@ -35,7 +35,8 @@ variable "subnet_id" {
 
 variable "security_group_id" {
   type        = string
-  description = "Security group for the builder instance. Must allow inbound SSH (22) from wherever `packer build` runs - project-10/security-groups/scripts/add-rule.sh can add that rule."
+  default     = ""
+  description = "Security group for the builder instance. Empty (the default via manage_ami.sh, BUILD_SG=temporary) = Packer creates a temporary SG allowing SSH only from this machine's public IP and deletes it afterwards. Set = used as-is, and must then allow inbound SSH (22) from wherever `packer build` runs."
 }
 
 variable "instance_type" {

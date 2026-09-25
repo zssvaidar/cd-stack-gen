@@ -40,6 +40,15 @@ delete() {
     # Instance profile (iam is global - no --region)
     # --------------------------------------------------
 
+    # inline policies egress/egress-balancer attached to the role so instances can read their
+    # Cloudflare tunnel token (lib_cloudflare_tunnel.sh) - scoped to this Purpose, and the role
+    # itself is shared (jenkins-role by default), so only these are removed, never the role
+    for policy in $(aws iam list-role-policies --role-name "$ROLE_NAME" --query 'PolicyNames' --output text 2>/dev/null); do
+        [[ "$policy" == cloudflare-tunnel-"$Purpose"-* ]] || continue
+        echo "Removing inline policy from $ROLE_NAME: $policy"
+        aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$policy"
+    done
+
     if aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
         echo "Removing role from instance profile: $INSTANCE_PROFILE_NAME"
 
