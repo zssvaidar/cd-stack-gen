@@ -38,16 +38,28 @@ systemd unit(s). The app itself is the same dependency-free app as
 replace the `cat > /opt/app/server.js` block with your own deploy step (copy build output in,
 fetch from S3/git, …) once you have a real one.
 
-`bun.sh` is the same shape again, for a Bun app that has a build step producing static client
-assets alongside its server — the way [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s
-`bun run build` emits `dist/public/*` next to `dist/index.js`. Bun itself is installed via the
-official install script (not in Amazon Linux's repos) and symlinked onto `PATH`. The nginx config
-here does more than `nodejs.sh`'s straight reverse proxy: `try_files` serves a request directly
-off `/opt/app/public` when it matches a built asset, and only falls through to `proxy_pass` at
-`127.0.0.1:3000` for everything the static server can't answer (SSR pages, `/health`, any other
-app route) — static assets never round-trip through the Bun process. Swap the placeholder
-`/opt/app/index.ts` and `/opt/app/public/hydrate.js` for a real `bun run build` output copied in
-from CI/S3/git; the systemd unit and nginx `location` blocks stay as-is.
+`bun.sh` is for a Bun app that has a build step producing static client assets alongside its
+server, the way [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `bun run build` emits
+`dist/public/*` next to `dist/index.js`. **There is no nginx on the instance.** Bun listens on
+`0.0.0.0:80` and serves both the built files in `/opt/app/public` (straight off disk, confined to
+that directory so `/../etc/passwd` gets a 404) and the SSR/API routes. TLS, load balancing and
+the public entry point are the egress-balancer's job (`run.sh egress-balancer`). Its default
+`BACKEND_PORT=80` matches, so a second nginx here would only add a hop. Bun is installed via the
+official install script (not in Amazon Linux's repos) to `/usr/local/bin/bun`, and the systemd
+unit runs it as the unprivileged `bunapp` user with only `CAP_NET_BIND_SERVICE` to bind :80. Swap
+the placeholder `/opt/app/index.ts` and `/opt/app/public/hydrate.js` for a real `bun run build`
+output copied in from CI/S3/git. The unit only needs something that honours `PORT`/`HOST`.
+
+`bun_cloudflared.sh` is the same app reached through a **Cloudflare Tunnel** instead of the
+balancer. Bun listens on `127.0.0.1:80` only, and `cloudflared` on the same instance forwards the
+tunnel's public hostname to it. Nothing on the box accepts inbound traffic, so no inbound
+security-group rule is needed. The app tier still needs outbound internet (the egress
+gateway/balancer's NAT) for `cloudflared` to reach Cloudflare. `cloudflared` ships switched off.
+`run.sh instance-ami <name> bun_cloudflared <count> create` with `CLOUDFLARE_TUNNEL_TOKEN` stores
+the token in SSM and turns it on (see the top-level README). The token is never baked into the
+image. Set the tunnel's public hostname service to `http://localhost:80` in the Cloudflare
+dashboard. The app section is kept identical to `bun.sh` apart from `HOST`, so change both
+together. The cloudflared section is the same block as in `egress-gateway.sh`.
 
 **Runs as root.** Packer connects over SSH as `ec2-user`, not root, but `packer/ami.pkr.hcl`'s
 provisioner block wraps the script in `sudo` (`execute_command`) — the same effective privilege

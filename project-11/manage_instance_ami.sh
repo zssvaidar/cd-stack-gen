@@ -2,6 +2,12 @@
 # looked up in $STATE_FILE by that same <name>/<env-type> pair, instead of
 # manage_instances.sh's default latest-Amazon-Linux-2023 lookup. Same subnet/security
 # group/key/instance-profile wiring as manage_instances.sh otherwise.
+#
+# Optional Cloudflare Tunnel (CLOUDFLARE_TUNNEL_TOKEN or CLOUDFLARE_TUNNEL_PARAM set), for images
+# that ship cloudflared switched off (ami-scripts/bun_cloudflared.sh): the token is stored in SSM,
+# the instance role is allowed to read it, and each instance gets the parameter name via
+# user-data at first boot - see lib_cloudflare_tunnel.sh. All instances of a batch share one
+# token, i.e. run connectors for the same tunnel, which Cloudflare load-balances across.
 
 source "$STATE_FILE"
 
@@ -29,6 +35,10 @@ esac
 
 : "${SUBNET_ID:?no subnet for tier=$TIER in $STATE_FILE - run 'run.sh network create' first}"
 : "${SG_ID:?no security group for tier=$TIER in $STATE_FILE - run 'run.sh network create' first}"
+
+TUNNEL_ROLE=app
+TUNNEL_NAME="${NAME}-${ENV_TYPE}"
+source ./lib_cloudflare_tunnel.sh
 
 [[ -n "$DATE_NAME" ]] || echo "warning: no DATE_NAME in $STATE_FILE - launching without a key pair (run 'run.sh keys <name> create' for SSH access)"
 [[ -n "$INSTANCE_PROFILE_NAME" ]] || echo "warning: no INSTANCE_PROFILE_NAME in $STATE_FILE - launching without SSM access (run 'run.sh ssm create' first)"
@@ -62,6 +72,16 @@ create() {
     [[ -n "$DATE_NAME" ]] && run_args+=(--key-name "$DATE_NAME")
     [[ -n "$INSTANCE_PROFILE_NAME" ]] && run_args+=(--iam-instance-profile "Name=$INSTANCE_PROFILE_NAME")
 
+    tunnel_prepare
+
+    # same user-data for every instance of the batch - it only carries the parameter's name
+    local user_data_file=""
+    if [[ -n "$TUNNEL_PARAM" ]]; then
+        user_data_file=$(mktemp)
+        { echo "#!/bin/bash"; echo "set -e"; tunnel_commands; } > "$user_data_file"
+        run_args+=(--user-data "file://$user_data_file")
+    fi
+
     for i in $(seq 1 "$COUNT"); do
         INSTANCE_NAME="${NAME}-${ENV_TYPE}-${i}"
 
@@ -89,9 +109,13 @@ create() {
         statefile
     done
 
+    [[ -n "$user_data_file" ]] && rm -f "$user_data_file"
+
     echo
     echo "========================================"
     echo "$COUNT instance(s) launched from $AMI_ID under '$NAME' ($ENV_TYPE, tier=$TIER)"
+    [[ -n "$TUNNEL_PARAM" ]] && \
+    echo "Tunnel: cloudflared on each, token from $TUNNEL_PARAM - set the public hostname's service to http://localhost:80"
     echo "========================================"
 }
 
@@ -104,6 +128,9 @@ delete() {
                    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
         --query 'Reservations[*].Instances[*].InstanceId' \
         --output text)
+
+    # the batch's tunnel token (default path only) and its read policy go with it
+    tunnel_delete_param
 
     if [[ -z "$INSTANCE_IDS" ]]; then
         echo "no matching instances"
