@@ -63,6 +63,27 @@ tagged with exactly those two to be picked up by that fleet-wide target:
 ROLE=app-server ENVIRONMENT=production ./run.sh instances web 2 create
 ```
 
+## `run.sh ssm {create|delete}`
+
+`create` wraps `$ROLE_NAME` (default `jenkins-role`, the existing role from
+`project-8/aws-perm-generator`) into `ssm-instance-profile-$PURPOSE` — this is what every other
+`create` above attaches via `INSTANCE_PROFILE_NAME`, so run it once per `PURPOSE` before
+launching anything. Idempotent: re-running it when the profile already exists reuses it instead
+of failing on `EntityAlreadyExists`.
+
+Set `DEPLOY_ARTIFACT_BUCKET` to also grant `$ROLE_NAME` a scoped `s3:GetObject` on that bucket
+(inline policy `deploy-artifact-read-$PURPOSE`) — for a deploy pipeline whose instances pull
+their own deploy script or build artifact out of S3 with their own instance profile, instead of
+that bucket's read access having to be granted to the shared role by hand:
+
+```bash
+DEPLOY_ARTIFACT_BUCKET=testing-node-app-142369633239 ./run.sh ssm create
+```
+
+Safe to re-run with a different bucket (`put-role-policy` overwrites the same-named policy
+rather than stacking). `delete` removes this policy the same way it already removes the
+Cloudflare-tunnel ones, without touching the shared role itself.
+
 ## `run.sh s3 <name> {create|delete}`
 
 `create` makes `$BUCKET_NAME = ${PURPOSE}-${name}-${account_id}` — S3 bucket names are unique

@@ -16,21 +16,39 @@ EOF
 aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1 || { echo "no IAM role $ROLE_NAME"; exit 1; }
 
 create() {
-    echo "=== Creating instance profile ==="
+    if aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
+        echo "instance profile $INSTANCE_PROFILE_NAME already exists - reusing it"
+    else
+        echo "=== Creating instance profile ==="
 
-    aws iam create-instance-profile \
-        --instance-profile-name "$INSTANCE_PROFILE_NAME" \
-        --tags "Key=Purpose,Value=$Purpose" \
-        --output text >/dev/null
+        aws iam create-instance-profile \
+            --instance-profile-name "$INSTANCE_PROFILE_NAME" \
+            --tags "Key=Purpose,Value=$Purpose" \
+            --output text >/dev/null
 
-    aws iam add-role-to-instance-profile \
-        --instance-profile-name "$INSTANCE_PROFILE_NAME" \
-        --role-name "$ROLE_NAME"
+        aws iam add-role-to-instance-profile \
+            --instance-profile-name "$INSTANCE_PROFILE_NAME" \
+            --role-name "$ROLE_NAME"
 
-    echo "Role:             $ROLE_NAME"
-    echo "Instance profile: $INSTANCE_PROFILE_NAME"
+        echo "Role:             $ROLE_NAME"
+        echo "Instance profile: $INSTANCE_PROFILE_NAME"
 
-    statefile
+        statefile
+    fi
+
+    # optional: let instances read deploy artifacts (e.g. a Jenkins pipeline's SSM-pushed
+    # deploy.sh, or a build tarball) straight out of S3 with their own instance profile,
+    # instead of that bucket's read permission having to be granted to jenkins-role by hand -
+    # idempotent (put-role-policy overwrites), so re-running with a new bucket just re-scopes it
+    if [[ -n "$DEPLOY_ARTIFACT_BUCKET" ]]; then
+        aws iam put-role-policy \
+            --role-name "$ROLE_NAME" \
+            --policy-name "deploy-artifact-read-$Purpose" \
+            --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"ReadDeployArtifacts\",\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$DEPLOY_ARTIFACT_BUCKET/*\"}]}" \
+            || { echo "error: couldn't attach deploy-artifact-read-$Purpose to role $ROLE_NAME" >&2; exit 1; }
+
+        echo "Deploy artifacts: role $ROLE_NAME may s3:GetObject from $DEPLOY_ARTIFACT_BUCKET (inline policy deploy-artifact-read-$Purpose)"
+    fi
 }
 
 delete() {
@@ -48,6 +66,10 @@ delete() {
         echo "Removing inline policy from $ROLE_NAME: $policy"
         aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "$policy"
     done
+
+    if aws iam delete-role-policy --role-name "$ROLE_NAME" --policy-name "deploy-artifact-read-$Purpose" >/dev/null 2>&1; then
+        echo "Removed inline policy deploy-artifact-read-$Purpose from $ROLE_NAME"
+    fi
 
     if aws iam get-instance-profile --instance-profile-name "$INSTANCE_PROFILE_NAME" >/dev/null 2>&1; then
         echo "Removing role from instance profile: $INSTANCE_PROFILE_NAME"
