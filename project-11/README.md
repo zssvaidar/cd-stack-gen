@@ -84,6 +84,22 @@ Safe to re-run with a different bucket (`put-role-policy` overwrites the same-na
 rather than stacking). `delete` removes this policy the same way it already removes the
 Cloudflare-tunnel ones, without touching the shared role itself.
 
+**If SSM "Default Host Management Configuration" (Quick Setup) is enabled on the account**,
+granting `$ROLE_NAME` alone may not be enough. Symptom: `aws s3 cp` against the exact same
+object works fine from an interactive `aws ssm start-session` shell, but the identical command
+dispatched via `aws ssm send-command`/Run Command still gets `403 Forbidden` on `HeadObject` —
+even with a working IAM instance profile, no bucket policy, no KMS involved, `iam
+simulate-principal-policy` saying `allowed`, and no VPC-endpoint issue. Root cause: Run
+Command executions on an account with Default Host Management on can resolve permissions
+through the Quick-Setup-created `AWS-QuickSetup-SSM-DefaultEC2MgmtRole-<region>` role rather
+than (or in addition to) the instance's own attached instance profile — an interactive session
+doesn't go through that path, which is why only the dispatched command fails. If you hit this,
+the same `DEPLOY_ARTIFACT_BUCKET`-style grant needs to go on that Quick Setup role too, not just
+`$ROLE_NAME`. Check whether Default Host Management is on via Systems Manager → Fleet Manager
+in the console (or look for `AWS-QuickSetup-SSM-*` roles in IAM, as here) before spending time
+on bucket policies, KMS, or VPC endpoints chasing a Run-Command-only 403 that an interactive
+session doesn't reproduce.
+
 ## `run.sh s3 <name> {create|delete}`
 
 `create` makes `$BUCKET_NAME = ${PURPOSE}-${name}-${account_id}` — S3 bucket names are unique
