@@ -53,14 +53,29 @@ ensure_resource_group() {
         return
     fi
 
-    local query
-    query=$(printf '{"ResourceTypeFilters":["AWS::EC2::Instance"],"TagFilters":[{"Key":"Role","Values":["%s"]},{"Key":"Environment","Values":["%s"]}]}' "$ROLE" "$ENV_TYPE")
+    command -v jq >/dev/null 2>&1 || { echo "error: jq not found - needed to build the resource group's tag-filter query" >&2; exit 1; }
+
+    # ResourceQuery.Query is a plain string field holding *escaped* JSON, not a nested object -
+    # the API rejects a raw object there ("Invalid type for parameter ResourceQuery.Query ...
+    # valid types: <class 'str'>"). jq's tojson double-encodes it correctly instead of hand-escaping.
+    local resource_query
+    resource_query=$(jq -nc --arg role "$ROLE" --arg env "$ENV_TYPE" '
+        {
+            Type: "TAG_FILTERS_1_0",
+            Query: ({
+                ResourceTypeFilters: ["AWS::EC2::Instance"],
+                TagFilters: [
+                    {Key: "Role", Values: [$role]},
+                    {Key: "Environment", Values: [$env]}
+                ]
+            } | tojson)
+        }')
 
     aws resource-groups create-group \
         --region "$AWS_REGION" \
         --name "$RESOURCE_GROUP_NAME" \
         --description "EC2 instances with Role=$ROLE, Environment=$ENV_TYPE (managed by run.sh instance-ami)" \
-        --resource-query "{\"Type\":\"TAG_FILTERS_1_0\",\"Query\":$query}" \
+        --resource-query "$resource_query" \
         --tags "Purpose=$Purpose" \
         >/dev/null
 

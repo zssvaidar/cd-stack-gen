@@ -205,7 +205,10 @@ aws ssm send-command --targets "Key=resource-groups:Name,Values=app-server-produ
 other batches under the same `ROLE`/`ENV_TYPE` may still rely on; delete it by hand
 (`aws resource-groups delete-group --group-name <group>`) once nothing targets it anymore.
 Whoever runs `run.sh instance-ami` needs `resource-groups:CreateGroup` and
-`resource-groups:GetGroup` in addition to the EC2 permissions it already needed.
+`resource-groups:GetGroup` in addition to the EC2 permissions it already needed, and `jq` on
+PATH (same prerequisite `ami create` already has) — `ResourceQuery.Query` is a plain string
+field holding *escaped* JSON, not a nested object, and `jq`'s `tojson` is what builds that
+double-encoding correctly instead of hand-escaping it.
 
 **Cloudflare Tunnel on app instances.** For an image that ships `cloudflared` switched off
 (`ami-scripts/bun_cloudflared.sh`), pass the tunnel token on `create`, the same way as for
