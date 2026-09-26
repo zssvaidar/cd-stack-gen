@@ -77,7 +77,7 @@ ensure_resource_group() {
         --description "EC2 instances with Role=$ROLE, Environment=$ENV_TYPE (managed by run.sh instance-ami)" \
         --resource-query "$resource_query" \
         --tags "Purpose=$Purpose" \
-        >/dev/null
+        >/dev/null || { echo "error: failed to create resource group $RESOURCE_GROUP_NAME - see the AWS CLI error above" >&2; exit 1; }
 
     echo "created resource group $RESOURCE_GROUP_NAME (Role=$ROLE, Environment=$ENV_TYPE) - membership is dynamic, no per-instance registration needed"
 }
