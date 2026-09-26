@@ -74,7 +74,7 @@ ensure_resource_group() {
     aws resource-groups create-group \
         --region "$AWS_REGION" \
         --name "$RESOURCE_GROUP_NAME" \
-        --description "EC2 instances with Role=$ROLE, Environment=$ENV_TYPE (managed by run.sh instance-ami)" \
+        --description "EC2 instances with Role $ROLE and Environment $ENV_TYPE - managed by run.sh instance-ami" \
         --resource-query "$resource_query" \
         --tags "Purpose=$Purpose" \
         >/dev/null || { echo "error: failed to create resource group $RESOURCE_GROUP_NAME - see the AWS CLI error above" >&2; exit 1; }
