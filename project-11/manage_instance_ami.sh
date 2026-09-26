@@ -43,6 +43,45 @@ source ./lib_cloudflare_tunnel.sh
 [[ -n "$DATE_NAME" ]] || echo "warning: no DATE_NAME in $STATE_FILE - launching without a key pair (run 'run.sh keys <name> create' for SSH access)"
 [[ -n "$INSTANCE_PROFILE_NAME" ]] || echo "warning: no INSTANCE_PROFILE_NAME in $STATE_FILE - launching without SSM access (run 'run.sh ssm create' first)"
 
+ensure_resource_group() {
+    [[ -n "$ROLE" ]] || { echo "warning: ROLE unset - skipping resource group (a deploy pipeline targeting by resource group needs one)"; return; }
+
+    RESOURCE_GROUP_NAME="${RESOURCE_GROUP_NAME:-${ROLE}-${ENV_TYPE}}"
+
+    if aws resource-groups get-group --region "$AWS_REGION" --group-name "$RESOURCE_GROUP_NAME" >/dev/null 2>&1; then
+        echo "resource group $RESOURCE_GROUP_NAME already exists - its tag query is static, nothing to update"
+        return
+    fi
+
+    command -v jq >/dev/null 2>&1 || { echo "error: jq not found - needed to build the resource group's tag-filter query" >&2; exit 1; }
+
+    # ResourceQuery.Query is a plain string field holding *escaped* JSON, not a nested object -
+    # the API rejects a raw object there ("Invalid type for parameter ResourceQuery.Query ...
+    # valid types: <class 'str'>"). jq's tojson double-encodes it correctly instead of hand-escaping.
+    local resource_query
+    resource_query=$(jq -nc --arg role "$ROLE" --arg env "$ENV_TYPE" '
+        {
+            Type: "TAG_FILTERS_1_0",
+            Query: ({
+                ResourceTypeFilters: ["AWS::EC2::Instance"],
+                TagFilters: [
+                    {Key: "Role", Values: [$role]},
+                    {Key: "Environment", Values: [$env]}
+                ]
+            } | tojson)
+        }')
+
+    aws resource-groups create-group \
+        --region "$AWS_REGION" \
+        --name "$RESOURCE_GROUP_NAME" \
+        --description "EC2 instances with Role=$ROLE, Environment=$ENV_TYPE (managed by run.sh instance-ami)" \
+        --resource-query "$resource_query" \
+        --tags "Purpose=$Purpose" \
+        >/dev/null
+
+    echo "created resource group $RESOURCE_GROUP_NAME (Role=$ROLE, Environment=$ENV_TYPE) - membership is dynamic, no per-instance registration needed"
+}
+
 statefile() {
     local var_prefix
     var_prefix="INSTANCE_$(echo "$INSTANCE_NAME" | tr '-' '_' | tr '[:lower:]' '[:upper:]')"
@@ -62,6 +101,8 @@ statefile() {
 }
 
 create() {
+    ensure_resource_group
+
     local run_args=(
         --region "$AWS_REGION"
         --image-id "$AMI_ID"
@@ -111,9 +152,18 @@ create() {
 
     [[ -n "$user_data_file" ]] && rm -f "$user_data_file"
 
+    if [[ -n "$RESOURCE_GROUP_NAME" ]]; then
+        {
+            echo
+            echo "# resource group for Role=$ROLE, Environment=$ENV_TYPE"
+            echo "export RESOURCE_GROUP_NAME=\"$RESOURCE_GROUP_NAME\""
+        } >> "$STATE_FILE"
+    fi
+
     echo
     echo "========================================"
     echo "$COUNT instance(s) launched from $AMI_ID under '$NAME' ($ENV_TYPE, tier=$TIER)"
+    [[ -n "$RESOURCE_GROUP_NAME" ]] && echo "Resource group: $RESOURCE_GROUP_NAME (SSM target: Key=resource-groups:Name,Values=$RESOURCE_GROUP_NAME)"
     [[ -n "$TUNNEL_PARAM" ]] && \
     echo "Tunnel: cloudflared on each, token from $TUNNEL_PARAM - set the public hostname's service to http://localhost:80"
     echo "========================================"

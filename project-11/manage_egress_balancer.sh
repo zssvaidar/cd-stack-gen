@@ -170,6 +170,27 @@ open_https_ingress() {
         || echo "Security group $1: tcp/$HTTPS_PORT rule already present (or couldn't be added)"
 }
 
+# backends only need to accept the balancer, not the world - referenced by SG id so it keeps
+# working whatever private IP the balancer ends up with. Idempotent (an existing identical rule is
+# fine), so `sync` re-asserts it too - that's what makes `BACKEND_PORT=3000 ... sync` work
+# without touching security groups by hand. A rule for a previous port is left in place until
+# `delete`, which revokes everything referencing the balancer's SG.
+open_backend_ingress() {
+    [[ -n "$BACKEND_SG" ]] || return 0
+    local out
+    if out=$(aws ec2 authorize-security-group-ingress \
+        --region "$AWS_REGION" \
+        --group-id "$BACKEND_SG" \
+        --ip-permissions "IpProtocol=tcp,FromPort=$BACKEND_PORT,ToPort=$BACKEND_PORT,UserIdGroupPairs=[{GroupId=$1,Description=from egress balancer $NAME}]" \
+        2>&1 >/dev/null); then
+        echo "Backend SG $BACKEND_SG: allows tcp/$BACKEND_PORT from $1"
+    elif [[ "$out" == *InvalidPermission.Duplicate* ]]; then
+        echo "Backend SG $BACKEND_SG: tcp/$BACKEND_PORT from $1 already allowed"
+    else
+        echo "warning: couldn't add tcp/$BACKEND_PORT from $1 to $BACKEND_SG - backends may be unreachable: $out" >&2
+    fi
+}
+
 find_instances() {
     aws ec2 describe-instances \
         --region "$AWS_REGION" \
@@ -221,17 +242,7 @@ create() {
 
     [[ -n "$HTTPS_DOMAINS" ]] && open_https_ingress "$SG_ID"
 
-    # backends only need to accept the balancer, not the world - referenced by SG id so it keeps
-    # working whatever private IP the balancer ends up with
-    if [[ -n "$BACKEND_SG" ]]; then
-        aws ec2 authorize-security-group-ingress \
-            --region "$AWS_REGION" \
-            --group-id "$BACKEND_SG" \
-            --ip-permissions "IpProtocol=tcp,FromPort=$BACKEND_PORT,ToPort=$BACKEND_PORT,UserIdGroupPairs=[{GroupId=$SG_ID,Description=from egress balancer $NAME}]" \
-            >/dev/null \
-            && echo "Backend SG $BACKEND_SG: allows tcp/$BACKEND_PORT from $SG_ID" \
-            || echo "warning: couldn't add tcp/$BACKEND_PORT from $SG_ID to $BACKEND_SG - backends may be unreachable" >&2
-    fi
+    open_backend_ingress "$SG_ID"
 
 
     echo "=== Launching $NAME (tier=$TIER) ==="
@@ -374,13 +385,16 @@ sync_balancer() {
     [[ -n "$INSTANCE_IDS" ]] || { echo "error: no running egress balancer tagged Purpose=$Purpose, Name=$NAME" >&2; exit 1; }
 
     local params cmds=()
-    if [[ -n "$HTTPS_DOMAINS" ]]; then
+    if [[ -n "$HTTPS_DOMAINS" || -n "$BACKENDS_SET" ]]; then
         for sg in $(aws ec2 describe-security-groups \
             --region "$AWS_REGION" \
             --filters "Name=tag:Purpose,Values=$Purpose" "Name=tag:Name,Values=$NAME" "Name=tag:Role,Values=egress-balancer" \
             --query 'SecurityGroups[*].GroupId' \
             --output text); do
-            open_https_ingress "$sg"
+            [[ -n "$HTTPS_DOMAINS" ]] && open_https_ingress "$sg"
+            # the backend list is being rewritten, possibly on a new BACKEND_PORT - make sure the
+            # backends' SG lets the balancer in on it
+            [[ -n "$BACKENDS_SET" ]] && open_backend_ingress "$sg"
         done
     fi
 
