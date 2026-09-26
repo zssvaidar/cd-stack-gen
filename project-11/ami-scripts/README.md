@@ -41,14 +41,23 @@ fetch from S3/git, …) once you have a real one.
 `bun.sh` is for a Bun app that has a build step producing static client assets alongside its
 server, the way [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `bun run build` emits
 `dist/public/*` next to `dist/index.js`. **There is no nginx on the instance.** Bun listens on
-`0.0.0.0:80` and serves both the built files in `/opt/app/public` (straight off disk, confined to
-that directory so `/../etc/passwd` gets a 404) and the SSR/API routes. TLS, load balancing and
-the public entry point are the egress-balancer's job (`run.sh egress-balancer`). Its default
-`BACKEND_PORT=80` matches, so a second nginx here would only add a hop. Bun is installed via the
-official install script (not in Amazon Linux's repos) to `/usr/local/bin/bun`, and the systemd
-unit runs it as the unprivileged `bunapp` user with only `CAP_NET_BIND_SERVICE` to bind :80. Swap
-the placeholder `/opt/app/index.ts` and `/opt/app/public/hydrate.js` for a real `bun run build`
-output copied in from CI/S3/git. The unit only needs something that honours `PORT`/`HOST`.
+`0.0.0.0:80` and serves both the built files in `public/` (straight off disk relative to
+`WorkingDirectory`, confined to that directory so `/../etc/passwd` gets a 404) and the SSR/API
+routes. TLS, load balancing and the public entry point are the egress-balancer's job
+(`run.sh egress-balancer`). Its default `BACKEND_PORT=80` matches, so a second nginx here would
+only add a hop. Bun is installed via the official install script (not in Amazon Linux's repos) to
+`/usr/local/bin/bun`, and the systemd unit (`myapp.service`) runs it as the unprivileged `bunapp`
+user with only `CAP_NET_BIND_SERVICE` to bind :80.
+
+**Layout matches `bun-hydrate/deploy.sh`, not a static directory.** The app lives at
+`/opt/myapp/releases/<version>/`, and `/opt/myapp/current` is a symlink to whichever release is
+live — `myapp.service`'s `WorkingDirectory` is that symlink, never a release path directly, so a
+`deploy.sh` run that re-points it and restarts the unit is a complete deploy. The baked image
+ships one release, `0-baked` (placeholder `index.ts` + `public/hydrate.js` — swap both for a real
+`bun run build` output at deploy time, not bake time), with `current` already pointed at it so the
+smoke test below and the instance's first boot both have something to serve. The unit only needs
+something that honours `PORT`/`HOST`; `PUBLIC_DIR` defaults to `public` relative to cwd, so it
+still resolves correctly no matter which release `current` points at.
 
 `bun_cloudflared.sh` is the same app reached through a **Cloudflare Tunnel** instead of the
 balancer. Bun listens on `127.0.0.1:80` only, and `cloudflared` on the same instance forwards the

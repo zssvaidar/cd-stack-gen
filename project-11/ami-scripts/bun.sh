@@ -53,24 +53,31 @@ command -v bun >/dev/null 2>&1 || { echo "bun.sh: bun install did not produce /u
 
 useradd --system --no-create-home --shell /sbin/nologin bunapp 2>/dev/null || true
 
-mkdir -p /opt/app/public
+# Same releases/<version> + current-symlink layout bun-hydrate/deploy.sh deploys into - the
+# baked copy here is release "0-baked", just so the image boots with a working app (and the
+# smoke test below has something to hit) before the first real deploy ever runs.
+APP_ROOT=/opt/myapp
+BAKED_RELEASE="$APP_ROOT/releases/0-baked"
+
+mkdir -p "$BAKED_RELEASE/public"
 
 # Stand-in for the client bundle a real build would emit into dist/public/.
-cat > /opt/app/public/hydrate.js <<'EOF'
+cat > "$BAKED_RELEASE/public/hydrate.js" <<'EOF'
 console.log("bun-hydrate placeholder client bundle - replace dist/public/* with a real build");
 EOF
 
 # Stand-in server. Static files first: a request that maps to a regular file under PUBLIC_DIR is
 # served straight off disk (resolved and checked to stay inside PUBLIC_DIR, so `/../etc/passwd`
 # can't escape it), then "/" is rendered on the fly and /health answered - the parts a static
-# server can't do. A real app swaps this for its own dist/index.js.
-cat > /opt/app/index.ts <<'EOF'
+# server can't do. A real app swaps this for its own dist/index.js. PUBLIC_DIR defaults relative
+# to cwd (the "current" symlink's target, whichever release that is), not a hardcoded path.
+cat > "$BAKED_RELEASE/index.ts" <<'EOF'
 import { stat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
 const PORT = Number(process.env.PORT || 80);
 const HOST = process.env.HOST || "0.0.0.0";
-const PUBLIC_DIR = resolve(process.env.PUBLIC_DIR || "/opt/app/public");
+const PUBLIC_DIR = resolve(process.env.PUBLIC_DIR || "public");
 const startedAt = Date.now();
 
 async function staticFile(pathname: string): Promise<Response | null> {
@@ -122,10 +129,14 @@ Bun.serve({
 console.log(`Listening on ${HOST}:${PORT}`);
 EOF
 
-chown -R bunapp:bunapp /opt/app
+chown -R bunapp:bunapp "$APP_ROOT"
+ln -sfn "$BAKED_RELEASE" "$APP_ROOT/current"
 
-# :80 without running as root - the capability is all the unprivileged bunapp user gets
-cat > /etc/systemd/system/bun-app.service <<'EOF'
+# :80 without running as root - the capability is all the unprivileged bunapp user gets.
+# WorkingDirectory is the "current" symlink, not a release path directly, so a deploy.sh
+# run that re-points it and restarts this unit is all a real deploy takes - matching
+# bun-hydrate/deploy.sh's SERVICE_NAME=myapp and its releases/<version>+current layout.
+cat > /etc/systemd/system/myapp.service <<EOF
 [Unit]
 Description=Bun app (project-11 CD stack)
 After=network.target
@@ -134,7 +145,7 @@ After=network.target
 Type=simple
 User=bunapp
 Group=bunapp
-WorkingDirectory=/opt/app
+WorkingDirectory=$APP_ROOT/current
 ExecStart=/usr/local/bin/bun run index.ts
 Restart=on-failure
 RestartSec=2
@@ -149,7 +160,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
-systemctl enable bun-app.service
+systemctl enable myapp.service
 
 
 # --------------------------------------------------
@@ -158,7 +169,7 @@ systemctl enable bun-app.service
 # snapshotted image.
 # --------------------------------------------------
 
-systemctl start bun-app.service
+systemctl start myapp.service
 sleep 2
 
 curl -fsS http://127.0.0.1/hydrate.js | grep -q 'placeholder client bundle' \
