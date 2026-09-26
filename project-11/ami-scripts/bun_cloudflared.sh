@@ -61,7 +61,7 @@ useradd --system --no-create-home --shell /sbin/nologin bunapp 2>/dev/null || tr
 # Same releases/<version> + current-symlink layout bun-hydrate/deploy.sh deploys into - the
 # baked copy here is release "0-baked", just so the image boots with a working app (and the
 # smoke test below has something to hit) before the first real deploy ever runs.
-APP_ROOT=/opt/myapp
+APP_ROOT=/opt/app
 BAKED_RELEASE="$APP_ROOT/releases/0-baked"
 
 mkdir -p "$BAKED_RELEASE/public"

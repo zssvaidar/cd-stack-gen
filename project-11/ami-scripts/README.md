@@ -50,7 +50,7 @@ only add a hop. Bun is installed via the official install script (not in Amazon 
 user with only `CAP_NET_BIND_SERVICE` to bind :80.
 
 **Layout matches `bun-hydrate/deploy.sh`, not a static directory.** The app lives at
-`/opt/myapp/releases/<version>/`, and `/opt/myapp/current` is a symlink to whichever release is
+`/opt/app/releases/<version>/`, and `/opt/app/current` is a symlink to whichever release is
 live — `myapp.service`'s `WorkingDirectory` is that symlink, never a release path directly, so a
 `deploy.sh` run that re-points it and restarts the unit is a complete deploy. The baked image
 ships one release, `0-baked` (placeholder `index.ts` + `public/hydrate.js` — swap both for a real
