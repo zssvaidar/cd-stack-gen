@@ -51,7 +51,7 @@ command -v bun >/dev/null 2>&1 || { echo "bun.sh: bun install did not produce /u
 # puts them, fetch from S3/git, ...) - the unit only needs something that honours PORT/HOST.
 # --------------------------------------------------
 
-useradd --system --no-create-home --shell /sbin/nologin bunapp 2>/dev/null || true
+useradd --system --no-create-home --shell /sbin/nologin nodeapp 2>/dev/null || true
 
 # Same releases/<version> + current-symlink layout bun-hydrate/deploy.sh deploys into - the
 # baked copy here is release "0-baked", just so the image boots with a working app (and the
@@ -129,10 +129,10 @@ Bun.serve({
 console.log(`Listening on ${HOST}:${PORT}`);
 EOF
 
-chown -R bunapp:bunapp "$APP_ROOT"
+chown -R nodeapp:nodeapp "$APP_ROOT"
 ln -sfn "$BAKED_RELEASE" "$APP_ROOT/current"
 
-# :80 without running as root - the capability is all the unprivileged bunapp user gets.
+# :80 without running as root - the capability is all the unprivileged nodeapp user gets.
 # WorkingDirectory is the "current" symlink, not a release path directly, so a deploy.sh
 # run that re-points it and restarts this unit is all a real deploy takes - matching
 # bun-hydrate/deploy.sh's SERVICE_NAME=node-app and its releases/<version>+current layout.
@@ -143,8 +143,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=bunapp
-Group=bunapp
+User=nodeapp
+Group=nodeapp
 WorkingDirectory=$APP_ROOT/current
 ExecStart=/usr/local/bin/bun run index.ts
 Restart=on-failure

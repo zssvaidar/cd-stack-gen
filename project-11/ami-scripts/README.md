@@ -46,7 +46,7 @@ server, the way [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `bun
 routes. TLS, load balancing and the public entry point are the egress-balancer's job
 (`run.sh egress-balancer`). Its default `BACKEND_PORT=80` matches, so a second nginx here would
 only add a hop. Bun is installed via the official install script (not in Amazon Linux's repos) to
-`/usr/local/bin/bun`, and the systemd unit (`node-app.service`) runs it as the unprivileged `bunapp`
+`/usr/local/bin/bun`, and the systemd unit (`node-app.service`) runs it as the unprivileged `nodeapp`
 user with only `CAP_NET_BIND_SERVICE` to bind :80.
 
 **Layout matches `bun-hydrate/deploy.sh`, not a static directory.** The app lives at
