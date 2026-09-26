@@ -141,8 +141,8 @@ ln -sfn "$BAKED_RELEASE" "$APP_ROOT/current"
 # loopback: cloudflared on this box is the only thing meant to reach it. WorkingDirectory is the
 # "current" symlink, not a release path directly, so a deploy.sh run that re-points it and
 # restarts this unit is all a real deploy takes - matching bun-hydrate/deploy.sh's
-# SERVICE_NAME=myapp and its releases/<version>+current layout.
-cat > /etc/systemd/system/myapp.service <<EOF
+# SERVICE_NAME=node-app and its releases/<version>+current layout.
+cat > /etc/systemd/system/node-app.service <<EOF
 [Unit]
 Description=Bun app (project-11 CD stack)
 After=network.target
@@ -166,7 +166,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
 
-systemctl enable myapp.service
+systemctl enable node-app.service
 
 
 # --------------------------------------------------
@@ -175,7 +175,7 @@ systemctl enable myapp.service
 # snapshotted image.
 # --------------------------------------------------
 
-systemctl start myapp.service
+systemctl start node-app.service
 sleep 2
 
 curl -fsS http://127.0.0.1/hydrate.js | grep -q 'placeholder client bundle' \
