@@ -53,7 +53,7 @@ user with only `CAP_NET_BIND_SERVICE` to bind :80.
 `/opt/app/releases/<version>/`, and `/opt/app/current` is a symlink to whichever release is
 live — `node-app.service`'s `WorkingDirectory` is that symlink, never a release path directly, so a
 `deploy.sh` run that re-points it and restarts the unit is a complete deploy. The baked image
-ships one release, `0-baked` (placeholder `index.ts` + `public/hydrate.js` — swap both for a real
+ships one release, `0-baked` (placeholder `dist/index.js` + `dist/public/hydrate.js` — swap both for a real
 `bun run build` output at deploy time, not bake time), with `current` already pointed at it so the
 smoke test below and the instance's first boot both have something to serve. The unit only needs
 something that honours `PORT`/`HOST`; `PUBLIC_DIR` defaults to `public` relative to cwd, so it

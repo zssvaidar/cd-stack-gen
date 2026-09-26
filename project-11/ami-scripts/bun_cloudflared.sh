@@ -64,29 +64,32 @@ useradd --system --no-create-home --shell /sbin/nologin nodeapp 2>/dev/null || t
 APP_ROOT=/opt/app
 BAKED_RELEASE="$APP_ROOT/releases/0-baked"
 
-mkdir -p "$BAKED_RELEASE/public"
+mkdir -p "$BAKED_RELEASE/dist/public"
 
 # Stand-in for the client bundle a real build would emit into dist/public/.
-cat > "$BAKED_RELEASE/public/hydrate.js" <<'EOF'
+cat > "$BAKED_RELEASE/dist/public/hydrate.js" <<'EOF'
 console.log("bun-hydrate placeholder client bundle - replace dist/public/* with a real build");
 EOF
 
-# Stand-in server. Static files first: a request that maps to a regular file under PUBLIC_DIR is
-# served straight off disk (resolved and checked to stay inside PUBLIC_DIR, so `/../etc/passwd`
-# can't escape it), then "/" is rendered on the fly and /health answered - the parts a static
-# server can't do. A real app swaps this for its own dist/index.js. PUBLIC_DIR defaults relative
-# to cwd (the "current" symlink's target, whichever release that is), not a hardcoded path.
-cat > "$BAKED_RELEASE/index.ts" <<'EOF'
+# Stand-in server, placed at dist/index.js - the exact path bun-hydrate's own `bun run build`
+# (scripts/build.ts) emits its real entry point to, and what deploy.sh's sanity check looks
+# for. Plain JS (no type annotations) since it ships as .js, not .ts. Static files first: a
+# request that maps to a regular file under PUBLIC_DIR is served straight off disk (resolved
+# and checked to stay inside PUBLIC_DIR, so `/../etc/passwd` can't escape it), then "/" is
+# rendered on the fly and /health answered - the parts a static server can't do. A real app
+# swaps this whole file for its own dist/index.js. PUBLIC_DIR defaults relative to cwd (the
+# "current" symlink's target, whichever release that is), not a hardcoded path.
+cat > "$BAKED_RELEASE/dist/index.js" <<'EOF'
 import { stat } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 
 const PORT = Number(process.env.PORT || 80);
 const HOST = process.env.HOST || "0.0.0.0";
-const PUBLIC_DIR = resolve(process.env.PUBLIC_DIR || "public");
+const PUBLIC_DIR = resolve(process.env.PUBLIC_DIR || "dist/public");
 const startedAt = Date.now();
 
-async function staticFile(pathname: string): Promise<Response | null> {
-  let decoded: string;
+async function staticFile(pathname) {
+  let decoded;
   try {
     decoded = decodeURIComponent(pathname);
   } catch {
@@ -152,7 +155,7 @@ Type=simple
 User=nodeapp
 Group=nodeapp
 WorkingDirectory=$APP_ROOT/current
-ExecStart=/usr/local/bin/bun run index.ts
+ExecStart=/usr/local/bin/bun run dist/index.js
 Restart=on-failure
 RestartSec=2
 Environment=PORT=80
