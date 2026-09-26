@@ -184,6 +184,29 @@ rewrite — it only ever reads an `AMI_..._ID` out of state, agnostic to how tha
 ./run.sh instance-ami myapp production 1 delete   # <count> only matters for create
 ```
 
+**Resource group for SSM targeting.** If `ROLE` is set, `create` also ensures an [AWS Resource
+Group](https://docs.aws.amazon.com/ARG/latest/userguide/welcome.html) exists — a tag-based
+query, `Role=$ROLE` + `Environment=$ENV_TYPE`, named `${ROLE}-${ENV_TYPE}` by default (override
+with `RESOURCE_GROUP_NAME`). A deploy pipeline can then target
+`Key=resource-groups:Name,Values=<group>` on `aws ssm send-command` instead of repeating the
+same two literal tag filters in every script/Jenkinsfile — one source of truth for "what is
+`app-server`/`production`" instead of a string duplicated wherever something needs to reach
+those instances. The query is static once created (`get-group` first, so a second `create`
+is a no-op) and membership is dynamic — any instance matching those two tags shows up
+automatically, no per-instance registration step, no update needed when a batch relaunches:
+
+```bash
+ROLE=app-server ./run.sh instance-ami myapp production 2 create
+# -> resource group app-server-production (Role=app-server, Environment=production)
+aws ssm send-command --targets "Key=resource-groups:Name,Values=app-server-production" ...
+```
+
+`delete` does not remove the resource group — it's a shared, non-destructive tag query that
+other batches under the same `ROLE`/`ENV_TYPE` may still rely on; delete it by hand
+(`aws resource-groups delete-group --group-name <group>`) once nothing targets it anymore.
+Whoever runs `run.sh instance-ami` needs `resource-groups:CreateGroup` and
+`resource-groups:GetGroup` in addition to the EC2 permissions it already needed.
+
 **Cloudflare Tunnel on app instances.** For an image that ships `cloudflared` switched off
 (`ami-scripts/bun_cloudflared.sh`), pass the tunnel token on `create`, the same way as for
 `egress`/`egress-balancer`:

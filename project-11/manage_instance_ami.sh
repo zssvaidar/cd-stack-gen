@@ -43,6 +43,30 @@ source ./lib_cloudflare_tunnel.sh
 [[ -n "$DATE_NAME" ]] || echo "warning: no DATE_NAME in $STATE_FILE - launching without a key pair (run 'run.sh keys <name> create' for SSH access)"
 [[ -n "$INSTANCE_PROFILE_NAME" ]] || echo "warning: no INSTANCE_PROFILE_NAME in $STATE_FILE - launching without SSM access (run 'run.sh ssm create' first)"
 
+ensure_resource_group() {
+    [[ -n "$ROLE" ]] || { echo "warning: ROLE unset - skipping resource group (a deploy pipeline targeting by resource group needs one)"; return; }
+
+    RESOURCE_GROUP_NAME="${RESOURCE_GROUP_NAME:-${ROLE}-${ENV_TYPE}}"
+
+    if aws resource-groups get-group --region "$AWS_REGION" --group-name "$RESOURCE_GROUP_NAME" >/dev/null 2>&1; then
+        echo "resource group $RESOURCE_GROUP_NAME already exists - its tag query is static, nothing to update"
+        return
+    fi
+
+    local query
+    query=$(printf '{"ResourceTypeFilters":["AWS::EC2::Instance"],"TagFilters":[{"Key":"Role","Values":["%s"]},{"Key":"Environment","Values":["%s"]}]}' "$ROLE" "$ENV_TYPE")
+
+    aws resource-groups create-group \
+        --region "$AWS_REGION" \
+        --name "$RESOURCE_GROUP_NAME" \
+        --description "EC2 instances with Role=$ROLE, Environment=$ENV_TYPE (managed by run.sh instance-ami)" \
+        --resource-query "{\"Type\":\"TAG_FILTERS_1_0\",\"Query\":$query}" \
+        --tags "Purpose=$Purpose" \
+        >/dev/null
+
+    echo "created resource group $RESOURCE_GROUP_NAME (Role=$ROLE, Environment=$ENV_TYPE) - membership is dynamic, no per-instance registration needed"
+}
+
 statefile() {
     local var_prefix
     var_prefix="INSTANCE_$(echo "$INSTANCE_NAME" | tr '-' '_' | tr '[:lower:]' '[:upper:]')"
@@ -62,6 +86,8 @@ statefile() {
 }
 
 create() {
+    ensure_resource_group
+
     local run_args=(
         --region "$AWS_REGION"
         --image-id "$AMI_ID"
@@ -111,9 +137,18 @@ create() {
 
     [[ -n "$user_data_file" ]] && rm -f "$user_data_file"
 
+    if [[ -n "$RESOURCE_GROUP_NAME" ]]; then
+        {
+            echo
+            echo "# resource group for Role=$ROLE, Environment=$ENV_TYPE"
+            echo "export RESOURCE_GROUP_NAME=\"$RESOURCE_GROUP_NAME\""
+        } >> "$STATE_FILE"
+    fi
+
     echo
     echo "========================================"
     echo "$COUNT instance(s) launched from $AMI_ID under '$NAME' ($ENV_TYPE, tier=$TIER)"
+    [[ -n "$RESOURCE_GROUP_NAME" ]] && echo "Resource group: $RESOURCE_GROUP_NAME (SSM target: Key=resource-groups:Name,Values=$RESOURCE_GROUP_NAME)"
     [[ -n "$TUNNEL_PARAM" ]] && \
     echo "Tunnel: cloudflared on each, token from $TUNNEL_PARAM - set the public hostname's service to http://localhost:80"
     echo "========================================"
