@@ -1,5 +1,5 @@
 #!/bin/sh
-# Runner side of the shared-secret registration (forgejo-init.sh does the Forgejo side), then a
+# Runner side of the shared-secret registration (forgejo-setup.sh does the Forgejo side), then a
 # config.yml rebuilt from the environment on every start - change RUNNER_LABELS/RUNNER_CAPACITY
 # in .env and `docker compose up -d` applies it - then the daemon itself.
 set -eu

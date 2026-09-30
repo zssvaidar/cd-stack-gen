@@ -25,7 +25,7 @@ cp .env.example .env
 #   FORGEJO_ADMIN_PASSWORD  your admin password
 #   RUNNER_SECRET           openssl rand -hex 20
 docker compose up -d
-docker compose logs -f     # "created admin", "runner registered", then the runner's "declared"
+docker compose logs -f     # forgejo-setup: "created admin", "runner registered"; then the runner starts
 ```
 
 Open `http://<FORGEJO_HOST>:3000` and log in as `FORGEJO_ADMIN_USER`. The runner should appear
@@ -35,8 +35,8 @@ The first boot sets both up:
 | Step | Where it happens |
 |---|---|
 | Config (SQLite, URLs, installer locked, Actions on) | `FORGEJO__*` environment variables in `docker-compose.yml` |
-| Admin account | `scripts/forgejo-init.sh`: `forgejo admin user create` (skipped if it exists) |
-| Runner registration, Forgejo side | `scripts/forgejo-init.sh`: `forgejo-cli actions register --secret $RUNNER_SECRET` |
+| Admin account | `forgejo-setup` service, `scripts/forgejo-setup.sh`: `forgejo admin user create` (skipped if it exists) |
+| Runner registration, Forgejo side | `forgejo-setup` service, `scripts/forgejo-setup.sh`: `forgejo-cli actions register --secret $RUNNER_SECRET` |
 | Runner registration, runner side | `scripts/runner-init.sh`: `forgejo-runner create-runner-file --secret $RUNNER_SECRET` |
 | Runner config (labels, network) | `scripts/runner-init.sh`: `config.yml`, rebuilt from `.env` on every start |
 
@@ -65,10 +65,12 @@ Workflows go in `.forgejo/workflows/*.yml` (GitHub Actions syntax). Forgejo also
 `.github/workflows/`. Repo secrets are set under **Repo → Settings → Actions → Secrets**.
 
 ## How it's wired
-- **Forgejo keeps the image's own startup.** `command:` replaces only the image's CMD, and
-  `forgejo-init.sh` starts Forgejo the same way (`s6-svscan`). It waits for `/api/healthz`,
-  runs the idempotent setup, then stays in the foreground. `docker stop` still shuts it down
-  cleanly.
+- **Forgejo starts exactly as its image intends.** There's no `command:` override. The one-time
+  setup runs in a separate `forgejo-setup` container, built from the same image and sharing the
+  `forgejo-data` volume (`app.ini` and the SQLite DB). It starts once Forgejo is healthy, runs
+  the idempotent setup, and exits. The runner waits for it to finish successfully, so the Forgejo
+  side of the registration always exists before the runner connects. Nothing depends on the
+  image's internal startup command, which changes between Forgejo releases.
 - **The runner runs as root** so it can use the host's `docker.sock` and start job containers
   next to itself. The jobs themselves *don't* get the socket (`docker_host: "-"`), so a workflow
   can't take over the host's Docker. The runner container can, though, so only register this
