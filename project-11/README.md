@@ -269,6 +269,55 @@ parameter. Rotating the token means storing a new one and relaunching the batch,
 `bun.sh`) stores and grants it, but the user-data step then fails on the box. The app itself is
 unaffected.
 
+**Settings for the provision script: `PROVISION_ENV`.** Space-separated `KEY=VALUE` pairs are
+exported to the script on the builder (Packer `environment_vars`) - for per-build choices like
+where to fetch the app from. Not for secrets (they'd sit on this build's command line): a script
+that needs one reads it from SSM itself, with the builder's instance profile.
+
+### The accounting suite on one Docker host (`ami-scripts/docker.sh`)
+
+Bakes [full-stackapps](https://github.com/zssvaidar/full-stackapps) - PostgreSQL, Keycloak, the
+Spring/Laravel/Django APIs and the React app - into one image, with **TLS terminated on the
+instance** by a Caddy container (Let's Encrypt): `https://<host>/` app, `/api/*` APIs, `/auth`
+Keycloak; only :80/:443 are published. Images are built during the bake, so instances boot
+straight into `docker compose up`; each instance generates its own secrets on first boot.
+
+```bash
+# 1. source: the repo is private - hand the builder a tarball in S3 it may read
+git -C ../full-stackapps archive --format=tar.gz -o /tmp/app.tar.gz master
+aws s3 cp /tmp/app.tar.gz s3://<bucket>/accounting/app.tar.gz
+DEPLOY_ARTIFACT_BUCKET=<bucket> ./run.sh ssm create      # instance profile may s3:GetObject there
+
+# 2. bake - a tier that routes to the IGW, enough RAM for the Java/PHP/JS builds
+PROVISION_ENV="APP_SOURCE=s3://<bucket>/accounting/app.tar.gz" \
+    TIER=bastion INSTANCE_TYPE=t3.large ./run.sh ami web docker create
+
+# 3. launch, open 80/443 (Let's Encrypt validates over them), give it a stable public IP
+TIER=bastion INSTANCE_TYPE=t3.large ./run.sh instance-ami web docker 1 create
+for port in 80 443; do
+    ../project-10/security-groups/scripts/add-rule.sh --sg <bastion-sg> --direction ingress \
+        --protocol tcp --port $port --cidr 0.0.0.0/0
+done
+./connect.sh attach web-docker-1          # Elastic IP - keep it, DNS will point at it
+
+# 4. DNS: A record acct.example.com -> that IP. Then, on the instance:
+./connect.sh session web-docker-1
+sudo accounting set PUBLIC_HOST=acct.example.com ACME_EMAIL=ops@example.com
+```
+
+Until step 4 the instance serves `https://<its IP>/` with a self-signed certificate. Git instead
+of S3 also works: `APP_SOURCE=https://<forgejo>/<owner>/full-stackapps.git` plus
+`APP_GIT_TOKEN_PARAM=/<path>` naming an SSM SecureString with a read-only token (the builder's
+instance profile needs `ssm:GetParameter` on it). On the instance, `accounting` is the one
+command: `status`, `logs [service]`, `set KEY=VALUE`, `credentials` (Keycloak admin password),
+`up`/`down`; settings live in `/etc/accounting/accounting.env`, generated secrets in
+`/etc/accounting/secrets.env`. Keycloak's admin console answers only from private ranges by
+default - open it through an SSM port-forward, or `accounting set ADMIN_ALLOW_CIDRS="private_ranges
+<your-ip>/32"`. Demo users are not imported (`accounting set DEMO_USERS=yes` before the first
+start keeps them, with this instance's own password from `accounting credentials`).
+See [full-stackapps' deploy/README.md](https://github.com/zssvaidar/full-stackapps/blob/master/deploy/README.md)
+for the routing and why TLS ends at Caddy.
+
 `ami delete` finds every AMI tagged with that exact `Purpose`/`Name`/`Environment`, deregisters
 each one, and deletes its backing snapshot(s) — looked up *before* deregistering, since an
 image's metadata (and the snapshot IDs in it) disappears the moment it's deregistered. This

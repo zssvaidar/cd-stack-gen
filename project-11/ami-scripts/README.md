@@ -70,6 +70,17 @@ image. Set the tunnel's public hostname service to `http://localhost:80` in the 
 dashboard. The app section is kept identical to `bun.sh` apart from `HOST`, so change both
 together. The cloudflared section is the same block as in `egress-gateway.sh`.
 
+`docker.sh` is a whole multi-service app on one Docker host: it installs Docker with the compose
+and buildx plugins (pinned, checksum-verified), fetches [full-stackapps](https://github.com/zssvaidar/full-stackapps)
+(`APP_SOURCE` via `PROVISION_ENV`: an `s3://` tarball, or git with a token from SSM), builds every
+image during the bake, and installs `/usr/local/bin/accounting` + `accounting.service`, which
+start the stack at boot behind Caddy - TLS terminated on the instance, Let's Encrypt once
+`PUBLIC_HOST`/`ACME_EMAIL` are set, self-signed on the bare IP until then. Like `nodejs.sh` it
+smoke-tests before snapshotting - here a real sign-in against Keycloak and calls to all three
+APIs over HTTPS - then deletes every container, volume, certificate and secret it created, so
+each instance starts empty and generates its own. See the top-level README for the full
+bake/launch/DNS walk-through.
+
 **Runs as root.** Packer connects over SSH as `ec2-user`, not root, but `packer/ami.pkr.hcl`'s
 provisioner block wraps the script in `sudo` (`execute_command`) — the same effective privilege
 the old user-data/cloud-init approach had, just made explicit instead of implicit. Write scripts
