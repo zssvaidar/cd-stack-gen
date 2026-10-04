@@ -1,10 +1,10 @@
 #!/bin/bash
 # Docker host running the whole accounting suite (github.com/zssvaidar/full-stackapps) on one
 # instance: PostgreSQL, Keycloak, the sales (Spring Boot), invoicing (Laravel) and ledger
-# (Django) APIs, the React app - and Caddy terminating TLS on the instance itself:
+# (Django) APIs, the React app - behind the Caddy gateway, which terminates TLS on the instance:
 #
 #   https://<host>/            React app          ┐
-#   https://<host>/api/<svc>/  the three APIs     ├─ caddy :443 (Let's Encrypt) -> gateway -> containers
+#   https://<host>/api/<svc>/  the three APIs     ├─ gateway (Caddy) :443, Let's Encrypt -> containers
 #   https://<host>/auth/       Keycloak           ┘   only :80/:443 published; :80 redirects
 #
 # Everything is built into the image (docker compose build + base images pulled), so an
@@ -299,7 +299,7 @@ chmod 755 /usr/local/bin/accounting
 
 cat > /etc/systemd/system/accounting.service <<'EOF'
 [Unit]
-Description=Accounting suite (docker compose: Caddy, gateway, APIs, Keycloak, PostgreSQL)
+Description=Accounting suite (docker compose: Caddy gateway, APIs, Keycloak, PostgreSQL)
 Requires=docker.service
 After=docker.service network-online.target
 Wants=network-online.target
