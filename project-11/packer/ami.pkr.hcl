@@ -72,6 +72,9 @@ build {
   provisioner "shell" {
     script = var.provision_script
 
+    # PROVISION_ENV from manage_ami.sh - per-build settings for the script (see variables.pkr.hcl)
+    environment_vars = var.provision_env
+
     # unlike the old cloud-init/user-data approach (which ran as root automatically), Packer's
     # shell provisioner connects as $ssh_username and runs the script as that user with no
     # elevation by default - ami-scripts/*.sh scripts write to root-owned paths (/etc/yum.repos.d,

@@ -20,6 +20,11 @@ ASSIGN_PUBLIC_IP="${ASSIGN_PUBLIC_IP:-true}"
 # allowing tcp/22 only from this machine's public IP and deletes it with the builder, nothing
 # to set up by hand; `tier` - reuse the tier's own SG, which must already allow port 22.
 BUILD_SG="${BUILD_SG:-temporary}"
+
+# Settings for the provision script itself, as space-separated KEY=VALUE pairs, e.g.
+#   PROVISION_ENV="APP_SOURCE=s3://my-bucket/accounting/app.tar.gz" run.sh ami ...
+# Exported to the script on the builder (packer's environment_vars). Not for secrets.
+PROVISION_ENV="${PROVISION_ENV:-}"
 [[ "$BUILD_SG" =~ ^(temporary|tier)$ ]] || { echo "error: BUILD_SG must be temporary or tier" >&2; exit 1; }
 
 PACKER_DIR="packer"
@@ -133,6 +138,17 @@ create() {
         -var "assign_public_ip=$ASSIGN_PUBLIC_IP"
         -var "instance_profile_name=$INSTANCE_PROFILE_NAME"
     )
+
+    if [[ -n "$PROVISION_ENV" ]]; then
+        local pair provision_env_json
+        for pair in $PROVISION_ENV; do
+            [[ "$pair" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]] || { echo "error: PROVISION_ENV entries must be KEY=VALUE, got '$pair'" >&2; exit 1; }
+        done
+        # word-split on purpose (one entry per pair), then JSON-encoded for HCL's list(string)
+        # shellcheck disable=SC2086
+        provision_env_json=$(printf '%s\n' $PROVISION_ENV | jq -R . | jq -sc .)
+        packer_vars+=(-var "provision_env=$provision_env_json")
+    fi
 
     echo "=== packer init ==="
     packer init "$PACKER_DIR" || exit 1
