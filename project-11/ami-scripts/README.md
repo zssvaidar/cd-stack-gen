@@ -24,6 +24,17 @@ systemd unit(s). The app itself is the same dependency-free app as
 replace the `cat > /opt/app/server.js` block with your own deploy step (copy build output in,
 fetch from S3/git, …) once you have a real one.
 
+`bun.sh` is the same shape again, for a Bun app that has a build step producing static client
+assets alongside its server — the way [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s
+`bun run build` emits `dist/public/*` next to `dist/index.js`. Bun itself is installed via the
+official install script (not in Amazon Linux's repos) and symlinked onto `PATH`. The nginx config
+here does more than `nodejs.sh`'s straight reverse proxy: `try_files` serves a request directly
+off `/opt/app/public` when it matches a built asset, and only falls through to `proxy_pass` at
+`127.0.0.1:3000` for everything the static server can't answer (SSR pages, `/health`, any other
+app route) — static assets never round-trip through the Bun process. Swap the placeholder
+`/opt/app/index.ts` and `/opt/app/public/hydrate.js` for a real `bun run build` output copied in
+from CI/S3/git; the systemd unit and nginx `location` blocks stay as-is.
+
 **Runs as root.** Packer connects over SSH as `ec2-user`, not root, but `packer/ami.pkr.hcl`'s
 provisioner block wraps the script in `sudo` (`execute_command`) — the same effective privilege
 the old user-data/cloud-init approach had, just made explicit instead of implicit. Write scripts
