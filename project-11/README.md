@@ -2,9 +2,13 @@
 
 A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances|s3|
 ami|instance-ami|egress> [args] {create|delete}` sources the matching `manage_*.sh` fragment,
-all of them sharing one Purpose-tagged state log at `state/$PURPOSE.env`. This is a leaner,
-flatter alternative to `project-9/agent-keys` + `project-10/vpc-network` + `project-10/ssm-manage`
-— same underlying AWS calls, one entry point and one state file instead of four separate ones.
+all of them sharing one Purpose-tagged state log at `state/$PURPOSE.env`. This started as a
+leaner, flatter alternative to `project-9/agent-keys` plus a now-retired `project-10` (separate
+vpc-network/ssm-manage/security-groups scripts, each with their own state) — same underlying
+AWS calls, one entry point and one state file instead of several separate ones. Three of
+project-10's standalone security-group utilities (`add-rule.sh`, `list-rules.sh`,
+`revoke-rule.sh` — see below) moved here rather than disappearing with it, since this project's
+intentionally-empty security groups still need them.
 
 ```bash
 cp wrapper/config/.env.example wrapper/config/.env   # fill in the creator credentials, once
@@ -130,8 +134,7 @@ for one and warns (doesn't block, since a broader rule or a different exact matc
 be fine) if it doesn't find an exact port-22 rule on the tier's SG:
 
 ```bash
-../project-10/security-groups/scripts/add-rule.sh --sg <sg-id> --direction ingress \
-    --protocol tcp --port 22 --cidr <your-ip>/32
+./add-rule.sh --sg <sg-id> --direction ingress --protocol tcp --port 22 --cidr <your-ip>/32
 ```
 
 An SSM-only alternative exists (Packer's `ssh_interface = "session_manager"`) that would avoid
@@ -265,24 +268,45 @@ the happy path that already produced real infrastructure:
   `SCRIPT_DIR` was set) that `create()` immediately recomputed correctly and `delete()` never
   read at all. Removed rather than fixed in place, since nothing depended on them.
 
-## Relationship to project-9 / project-10
+## `add-rule.sh` / `list-rules.sh` / `revoke-rule.sh`
 
-Same ideas, different shape:
+Standalone utilities, not run through `run.sh` — they don't manage a create/delete-able
+resource, just edit rules on a security group you already have the ID for. Every tier's SG
+`manage_network.sh` creates starts out completely empty (no ingress rules at all); these are how
+you open it up.
 
-- `project-9/agent-keys` ≈ `manage_keys.sh` (per-`date_name` state entries, purpose tagging,
-  Vault storage) — that version keeps its own dedicated `README.md`/`.gitignore`/policy file
-  and documents the Vault ACL for Jenkins in detail.
-- `project-10/vpc-network` + `project-10/security-groups` ≈ `manage_network.sh` — the
-  project-10 version splits public/private subnets across 2 AZs with (optionally) a NAT
-  Gateway and wires 3 separate security groups together via `--peer-sg` references;
-  `manage_network.sh` here is flatter: one public subnet per tier (bastion/app/db/egress), one
-  shared route table, all four security groups created empty (you add rules yourself, e.g. with
-  `../project-10/security-groups/scripts/add-rule.sh` if you want the same bastion → app → db
-  wiring).
-- `project-10/ssm-manage` ≈ `manage_ssm.sh` — project-10's version creates a dedicated
-  `ssm-instance-role-$PURPOSE` IAM role from scratch; `manage_ssm.sh` instead reuses the
-  existing `jenkins-role` from `project-8/aws-perm-generator` (override with `ROLE_NAME` if
-  that's not what you want), so it only ever creates the instance profile.
+```bash
+./add-rule.sh --sg <sg-id> --direction ingress --protocol tcp --port 22 --cidr <your-ip>/32
+./add-rule.sh --sg <sg-id> --direction ingress --protocol tcp --port 443 --peer-sg <other-sg-id>
+./list-rules.sh <sg-id>                                                    # see rule IDs
+./revoke-rule.sh --sg <sg-id> --direction ingress --rule-id <rule-id>      # remove by ID, not by tuple
+```
 
-Pick whichever fits — project-11 for a fast, single-file loop with one shared state log;
-project-9/project-10 when you want each concern documented and tested on its own.
+Prefer `--peer-sg` over `--cidr` for anything talking to another resource in this VPC: the rule
+reads as "traffic from the app tier" instead of a bare IP, and it never goes stale as instances
+are replaced. `revoke-rule.sh` removes by rule ID (from `list-rules.sh`) rather than
+re-specifying the same protocol/port/source tuple used to add it — the tuple-matching approach
+silently no-ops if the tuple doesn't match exactly (including whether the original rule had a
+description), which routinely leaves someone thinking a rule is gone when it isn't.
+
+Both default `AWS_REGION` to `ap-northeast-1` like the rest of this project, and use whatever
+AWS CLI credentials are already configured — same as every other script here, `run.sh`'s own
+`set_root` call leaves those configured for the rest of the shell session, so there's nothing
+extra to set up as long as you've run any `run.sh ... create` first.
+
+## Relationship to project-9
+
+`project-9/agent-keys` ≈ `manage_keys.sh` (per-`date_name` state entries, purpose tagging, Vault
+storage) — that version keeps its own dedicated `README.md`/`.gitignore`/policy file and
+documents the Vault ACL for Jenkins in detail. Pick whichever fits — project-11 for a fast,
+single-file loop with one shared state log; `project-9/agent-keys` when you want it documented
+and tested on its own.
+
+A separate `project-10` used to exist alongside this one — its own `vpc-network` and
+`ssm-manage` orchestrators, plus a `security-groups` toolkit with `create-sg.sh`/
+`attach-sg.sh`/`detach-sg.sh`/`dump-sg.sh`/`audit-open-sgs.sh`/`revoke-default-egress.sh` and a
+`provision-3tier.sh` reference architecture, each with their own state file. It's gone now;
+`manage_network.sh`/`manage_ssm.sh` fully replace the first two (same underlying AWS calls), and
+`add-rule.sh`/`list-rules.sh`/`revoke-rule.sh` above are the three pieces of the
+security-groups toolkit this project actually still needs — the rest (SG creation/attachment,
+auditing, snapshotting) had no caller here and didn't move over.

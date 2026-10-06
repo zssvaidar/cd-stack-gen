@@ -21,6 +21,8 @@ anything in the original repo.
 
 - **[project-9](project-9/)** — Jenkins deploy pipelines for EC2 and ECS, sample deploy targets in
   four languages, and a Telegram bot that reports when a service goes up or down.
-- **[project-10](project-10/)** — AWS security groups: least-privilege rules, SG-to-SG
-  references across a bastion → app → db tier, attaching/detaching them from running
-  instances safely, and auditing for internet-exposed or unused groups.
+- **[project-11](project-11/)** — unified `run.sh` dispatcher (keys, network, ssm, instances, s3,
+  ami, instance-ami, egress) sharing one Purpose-tagged state log: VPC + security groups across
+  four tiers, custom AMIs built with Packer, a self-managed NAT-instance egress gateway, and the
+  security-group rule-editing utilities (`add-rule.sh`/`list-rules.sh`/`revoke-rule.sh`) that
+  used to live in a separate `project-10`.

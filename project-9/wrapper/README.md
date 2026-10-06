@@ -1,12 +1,12 @@
 # wrapper
 
 Small shared shell library for the single-file `create`/`destroy` orchestrator scripts in this
-stack (see `../../project-10/ssm-manage`). Not meant to be copied - symlink it into a script's
-own directory instead, so there's one copy of `set_root`/`whoami`/`unset_aws` for everything to
-share:
+stack (see `../../project-11`, which symlinks this whole directory in). Not meant to be copied -
+symlink it into a script's own directory instead, so there's one copy of
+`set_root`/`whoami`/`unset_aws` for everything to share:
 
 ```bash
-cd project-10/some-new-orchestrator
+cd project-N/some-new-orchestrator
 ln -s ../../project-9/wrapper wrapper
 ```
 

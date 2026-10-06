@@ -78,7 +78,7 @@ create() {
     if [[ "$SSH_RULE_COUNT" == "0" ]]; then
         echo "warning: $SG_ID has no inbound rule for port 22 - Packer's SSH connection to the" >&2
         echo "builder will hang until it times out. Add one first, e.g.:" >&2
-        echo "  ../project-10/security-groups/scripts/add-rule.sh --sg $SG_ID --direction ingress \\" >&2
+        echo "  ./add-rule.sh --sg $SG_ID --direction ingress \\" >&2
         echo "      --protocol tcp --port 22 --cidr <your-ip>/32" >&2
     fi
 

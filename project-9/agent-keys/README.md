@@ -1,8 +1,8 @@
 # agent-keys
 
-`create`/`destroy` orchestrator (same pattern as `project-10`'s scripts) for per-host SSH
-keypairs used by `../ec2-deploy` — generated on demand instead of one static long-lived key
-shared by every deploy. Each keypair is named `<date>_<name>` (a "date_name", e.g.
+`create`/`destroy` orchestrator (same pattern `project-11`'s `manage_*.sh` scripts also follow)
+for per-host SSH keypairs used by `../ec2-deploy` — generated on demand instead of one static
+long-lived key shared by every deploy. Each keypair is named `<date>_<name>` (a "date_name", e.g.
 `2026-09-17_web-host`) and ends up in three places:
 
 1. **local** — `credentials/<date_name>/keys` (private) and `keys.pub` (public). Gitignored;
@@ -38,8 +38,9 @@ Removes the local `credentials/<date_name>/` copy, the AWS key pair, and the Vau
 
 ## State
 
-Unlike the one-shot state files in `../../project-10` (one VPC, one role — overwritten each
-run), `state/$PURPOSE.env` is a **log**: a single `PURPOSE` can hold many keypairs over time,
+Unlike `project-11`'s `manage_network.sh`/`manage_ssm.sh` (one VPC, one role — overwritten each
+run, sourcing the file after several `create`s leaves only the *last* one's values),
+`state/$PURPOSE.env` is a **log**: a single `PURPOSE` can hold many keypairs over time,
 so every `create` *appends* a block instead of replacing the file (and creates it if it
 doesn't exist yet — plain `>>` does both). Each entry's exports are prefixed with a
 name-safe version of its `date_name` (e.g. `AGENT_2026_09_17_WEB_HOST_KEY_DIR`) so sourcing

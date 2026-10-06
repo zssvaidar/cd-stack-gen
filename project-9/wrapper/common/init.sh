@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared by orchestrator scripts across project-9/project-10 - symlink this whole
+# Shared by orchestrator scripts across project-9/project-11 - symlink this whole
 # wrapper/ directory into a script's own folder (see its README) rather than copying it.
 
 unset_aws() {

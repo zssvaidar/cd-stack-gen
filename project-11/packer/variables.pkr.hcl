@@ -35,7 +35,7 @@ variable "subnet_id" {
 
 variable "security_group_id" {
   type        = string
-  description = "Security group for the builder instance. Must allow inbound SSH (22) from wherever `packer build` runs - project-10/security-groups/scripts/add-rule.sh can add that rule."
+  description = "Security group for the builder instance. Must allow inbound SSH (22) from wherever `packer build` runs - ./add-rule.sh can add that rule."
 }
 
 variable "instance_type" {
