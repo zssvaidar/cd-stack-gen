@@ -156,3 +156,8 @@ anything in the original repo.
   four tiers, custom AMIs built with Packer, a self-managed NAT-instance egress gateway, and the
   security-group rule-editing utilities (`add-rule.sh`/`list-rules.sh`/`revoke-rule.sh`) that
   used to live in a separate `project-10`.
+- **[project-12](project-12/)** — deploying [bun-hydrate](https://github.com/zssvaidar/bun-hydrate)
+  on ECS Fargate: RDS Postgres, a jobs/events worker service, and two ways to expose the web
+  tier (a Cloudflare Tunnel sidecar, or an Application Load Balancer) as separate `run.sh`
+  verbs — reusing project-11's VPC, app-tier subnet, and egress gateway rather than a second
+  network.
