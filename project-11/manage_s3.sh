@@ -2,7 +2,7 @@
 # just this one - so $BUCKET_NAME is derived from Purpose + <name> + the account id rather
 # than using <name> alone, which would collide with anyone else's bucket of the same name.
 
-[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
+[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress|egress-balancer)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 [[ -f "$STATE_FILE" ]] || { echo "no state file $STATE_FILE"; exit 1; }
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)

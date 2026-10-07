@@ -1,0 +1,97 @@
+# Self-hosted Forgejo (git server + Actions CI) and a Forgejo Runner on one Docker host - the
+# lightweight replacement for GitLab here: ~200 MB RAM for the whole stack instead of ~4 GB.
+#
+#   cp .env.example .env     # set FORGEJO_HOST, admin password, RUNNER_SECRET (openssl rand -hex 20)
+#   docker compose up -d     # forgejo-setup then creates the admin user and registers the runner
+#
+# See README.md for the full walkthrough.
+
+name: forgejo
+
+services:
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:${FORGEJO_VERSION:-15}
+    container_name: forgejo
+    restart: unless-stopped
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      # FORGEJO__<section>__<KEY> is written into app.ini on every start
+      FORGEJO__database__DB_TYPE: sqlite3
+      FORGEJO__server__ROOT_URL: http://${FORGEJO_HOST:?set FORGEJO_HOST in .env}:${FORGEJO_HTTP_PORT:-3000}/
+      FORGEJO__server__HTTP_PORT: "3000"
+      FORGEJO__server__SSH_DOMAIN: ${FORGEJO_HOST}
+      FORGEJO__server__SSH_PORT: ${FORGEJO_SSH_PORT:-2222}
+      # skip the web installer - everything it would ask is set right here
+      FORGEJO__security__INSTALL_LOCK: "true"
+      FORGEJO__service__DISABLE_REGISTRATION: ${FORGEJO_DISABLE_REGISTRATION:-true}
+      FORGEJO__actions__ENABLED: "true"
+    # no command override: Forgejo starts exactly as the image intends
+    ports:
+      - "${FORGEJO_HTTP_PORT:-3000}:3000"
+      - "${FORGEJO_SSH_PORT:-2222}:22"
+    volumes:
+      - forgejo-data:/data
+    networks:
+      - forgejo
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/healthz >/dev/null 2>&1 || curl -fsS http://localhost:3000/api/healthz >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # One-shot, runs on every `docker compose up` once Forgejo is healthy: creates the admin
+  # account and pre-registers the runner (both idempotent), then exits. A separate container
+  # rather than wrapping the forgejo service's startup, so nothing depends on the image's
+  # internal CMD. Talks to the same SQLite DB and app.ini through the shared data volume.
+  forgejo-setup:
+    image: codeberg.org/forgejo/forgejo:${FORGEJO_VERSION:-15}
+    restart: "no"
+    depends_on:
+      forgejo:
+        condition: service_healthy
+    environment:
+      FORGEJO_ADMIN_USER: ${FORGEJO_ADMIN_USER:-forgejo_admin}
+      FORGEJO_ADMIN_PASSWORD: ${FORGEJO_ADMIN_PASSWORD:?set FORGEJO_ADMIN_PASSWORD in .env}
+      FORGEJO_ADMIN_EMAIL: ${FORGEJO_ADMIN_EMAIL:-admin@example.com}
+      RUNNER_SECRET: ${RUNNER_SECRET:?set RUNNER_SECRET in .env - openssl rand -hex 20}
+      RUNNER_NAME: ${RUNNER_NAME:-docker-runner}
+    entrypoint: ["/bin/bash", "/init/forgejo-setup.sh"]
+    volumes:
+      - forgejo-data:/data
+      - ./scripts/forgejo-setup.sh:/init/forgejo-setup.sh:ro
+    networks:
+      - forgejo
+
+  runner:
+    image: code.forgejo.org/forgejo/runner:${RUNNER_VERSION:-13}
+    container_name: forgejo-runner
+    restart: unless-stopped
+    depends_on:
+      # only start once the Forgejo side of the registration exists
+      forgejo-setup:
+        condition: service_completed_successfully
+    # root so it can use the host's docker.sock to start job containers
+    user: "0:0"
+    environment:
+      RUNNER_SECRET: ${RUNNER_SECRET}
+      RUNNER_NAME: ${RUNNER_NAME:-docker-runner}
+      RUNNER_LABELS: ${RUNNER_LABELS:-docker:docker://node:20-bookworm,bun-hydrate-deploy:docker://node:20-bookworm}
+      RUNNER_CAPACITY: ${RUNNER_CAPACITY:-1}
+    command: ["/bin/sh", "/init/runner-init.sh"]
+    volumes:
+      - runner-data:/data
+      - ./scripts/runner-init.sh:/init/runner-init.sh:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - forgejo
+
+networks:
+  forgejo:
+    # fixed name - runner-init.sh puts job containers on it (container.network)
+    name: forgejo-net
+
+volumes:
+  forgejo-data:
+  runner-data:

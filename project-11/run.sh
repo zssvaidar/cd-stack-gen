@@ -53,8 +53,12 @@ case "$1" in
         source ./manage_instance_ami.sh
         ;;
     egress)
-        NAME="${2:?usage: run.sh egress <name> create/delete}"
+        NAME="${2:?usage: run.sh egress <name> create/sync/delete}"
         source ./manage_egress_instance.sh
+        ;;
+    egress-balancer)
+        NAME="${2:?usage: run.sh egress-balancer <name> create/sync/delete}"
+        source ./manage_egress_balancer.sh
         ;;
     *)
         echo
@@ -65,7 +69,8 @@ case "$1" in
         echo "Usage: run.sh s3 <name> {create|delete}"
         echo "Usage: run.sh ami <name> <env-type> {create|delete}"
         echo "Usage: run.sh instance-ami <name> <env-type> <count> {create|delete}"
-        echo "Usage: run.sh egress <name> {create|delete}"
+        echo "Usage: run.sh egress <name> {create|sync|delete}"
+        echo "Usage: run.sh egress-balancer <name> {create|sync|delete}"
         exit 1
         ;;
 esac

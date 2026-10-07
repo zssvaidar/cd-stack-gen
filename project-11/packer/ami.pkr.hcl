@@ -33,10 +33,16 @@ source "amazon-ebs" "ami" {
   # manage_instance_ami.sh for real deploys, not just kept as a build artifact
   encrypt_boot = true
 
-  subnet_id                   = var.subnet_id
-  security_group_id           = var.security_group_id
-  associate_public_ip_address = var.assign_public_ip
-  iam_instance_profile        = var.instance_profile_name != "" ? var.instance_profile_name : null
+  subnet_id = var.subnet_id
+
+  # no security_group_id (manage_ami.sh's default, BUILD_SG=temporary): Packer creates its own
+  # temporary SG allowing tcp/22 only from the public IP of the machine running `packer build`,
+  # and deletes it with the builder - no manual port-22 rule, and the shared tier SGs are never
+  # touched. A given security_group_id (BUILD_SG=tier) is used as-is instead.
+  security_group_id                         = var.security_group_id != "" ? var.security_group_id : null
+  temporary_security_group_source_public_ip = var.security_group_id == ""
+  associate_public_ip_address               = var.assign_public_ip
+  iam_instance_profile                      = var.instance_profile_name != "" ? var.instance_profile_name : null
 
   # no ssh_keypair_name set - Packer generates a temporary ed25519 keypair for just this
   # build and tears it down again afterward, so the builder's SSH access never depends on
@@ -65,6 +71,9 @@ build {
 
   provisioner "shell" {
     script = var.provision_script
+
+    # PROVISION_ENV from manage_ami.sh - per-build settings for the script (see variables.pkr.hcl)
+    environment_vars = var.provision_env
 
     # unlike the old cloud-init/user-data approach (which ran as root automatically), Packer's
     # shell provisioner connects as $ssh_username and runs the script as that user with no

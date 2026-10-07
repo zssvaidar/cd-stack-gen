@@ -35,7 +35,8 @@ variable "subnet_id" {
 
 variable "security_group_id" {
   type        = string
-  description = "Security group for the builder instance. Must allow inbound SSH (22) from wherever `packer build` runs - ./add-rule.sh can add that rule."
+  default     = ""
+  description = "Security group for the builder instance. Empty (the default via manage_ami.sh, BUILD_SG=temporary) = Packer creates a temporary SG allowing SSH only from this machine's public IP and deletes it afterwards. Set = used as-is, and must then allow inbound SSH (22) from wherever `packer build` runs - ./add-rule.sh can add that rule."
 }
 
 variable "instance_type" {
@@ -53,4 +54,10 @@ variable "assign_public_ip" {
   type        = bool
   default     = true
   description = "The subnets project-11/manage_network.sh creates don't auto-assign public IPs and this network has no NAT gateway, so without one the builder has a route to the internet gateway but no way to actually use it - package downloads in the provisioning script would hang. Set false only if a NAT gateway exists instead."
+}
+
+variable "provision_env" {
+  type        = list(string)
+  default     = []
+  description = "KEY=VALUE pairs exported to the provision script (manage_ami.sh: PROVISION_ENV) - for settings like where to fetch the app from. Not for secrets: they'd sit in this build's command line; let the script read secrets from SSM with the builder's instance profile instead."
 }

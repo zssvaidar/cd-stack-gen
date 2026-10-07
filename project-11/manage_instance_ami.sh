@@ -2,10 +2,16 @@
 # looked up in $STATE_FILE by that same <name>/<env-type> pair, instead of
 # manage_instances.sh's default latest-Amazon-Linux-2023 lookup. Same subnet/security
 # group/key/instance-profile wiring as manage_instances.sh otherwise.
+#
+# Optional Cloudflare Tunnel (CLOUDFLARE_TUNNEL_TOKEN or CLOUDFLARE_TUNNEL_PARAM set), for images
+# that ship cloudflared switched off (ami-scripts/bun_cloudflared.sh): the token is stored in SSM,
+# the instance role is allowed to read it, and each instance gets the parameter name via
+# user-data at first boot - see lib_cloudflare_tunnel.sh. All instances of a batch share one
+# token, i.e. run connectors for the same tunnel, which Cloudflare load-balances across.
 
 source "$STATE_FILE"
 
-[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
+[[ "$NAME" =~ ^(create|delete|keys|ssm|network|instances|s3|ami|instance-ami|egress|egress-balancer)$ ]] && { echo "error: invalid name '$NAME'" >&2; exit 1; }
 [[ "$COUNT" =~ ^[0-9]+$ ]] && [ "$COUNT" -ge 1 ] || { echo "error: count must be a positive integer" >&2; exit 1; }
 
 ENV_TYPE="${ENV_TYPE:?set ENV_TYPE, matching what you built with 'run.sh ami'}"
@@ -30,8 +36,51 @@ esac
 : "${SUBNET_ID:?no subnet for tier=$TIER in $STATE_FILE - run 'run.sh network create' first}"
 : "${SG_ID:?no security group for tier=$TIER in $STATE_FILE - run 'run.sh network create' first}"
 
+TUNNEL_ROLE=app
+TUNNEL_NAME="${NAME}-${ENV_TYPE}"
+source ./lib_cloudflare_tunnel.sh
+
 [[ -n "$DATE_NAME" ]] || echo "warning: no DATE_NAME in $STATE_FILE - launching without a key pair (run 'run.sh keys <name> create' for SSH access)"
 [[ -n "$INSTANCE_PROFILE_NAME" ]] || echo "warning: no INSTANCE_PROFILE_NAME in $STATE_FILE - launching without SSM access (run 'run.sh ssm create' first)"
+
+ensure_resource_group() {
+    [[ -n "$ROLE" ]] || { echo "warning: ROLE unset - skipping resource group (a deploy pipeline targeting by resource group needs one)"; return; }
+
+    RESOURCE_GROUP_NAME="${RESOURCE_GROUP_NAME:-${ROLE}-${ENV_TYPE}}"
+
+    if aws resource-groups get-group --region "$AWS_REGION" --group-name "$RESOURCE_GROUP_NAME" >/dev/null 2>&1; then
+        echo "resource group $RESOURCE_GROUP_NAME already exists - its tag query is static, nothing to update"
+        return
+    fi
+
+    command -v jq >/dev/null 2>&1 || { echo "error: jq not found - needed to build the resource group's tag-filter query" >&2; exit 1; }
+
+    # ResourceQuery.Query is a plain string field holding *escaped* JSON, not a nested object -
+    # the API rejects a raw object there ("Invalid type for parameter ResourceQuery.Query ...
+    # valid types: <class 'str'>"). jq's tojson double-encodes it correctly instead of hand-escaping.
+    local resource_query
+    resource_query=$(jq -nc --arg role "$ROLE" --arg env "$ENV_TYPE" '
+        {
+            Type: "TAG_FILTERS_1_0",
+            Query: ({
+                ResourceTypeFilters: ["AWS::EC2::Instance"],
+                TagFilters: [
+                    {Key: "Role", Values: [$role]},
+                    {Key: "Environment", Values: [$env]}
+                ]
+            } | tojson)
+        }')
+
+    aws resource-groups create-group \
+        --region "$AWS_REGION" \
+        --name "$RESOURCE_GROUP_NAME" \
+        --description "EC2 instances with Role $ROLE and Environment $ENV_TYPE - managed by run.sh instance-ami" \
+        --resource-query "$resource_query" \
+        --tags "Purpose=$Purpose" \
+        >/dev/null || { echo "error: failed to create resource group $RESOURCE_GROUP_NAME - see the AWS CLI error above" >&2; exit 1; }
+
+    echo "created resource group $RESOURCE_GROUP_NAME (Role=$ROLE, Environment=$ENV_TYPE) - membership is dynamic, no per-instance registration needed"
+}
 
 statefile() {
     local var_prefix
@@ -52,6 +101,8 @@ statefile() {
 }
 
 create() {
+    ensure_resource_group
+
     local run_args=(
         --region "$AWS_REGION"
         --image-id "$AMI_ID"
@@ -61,6 +112,16 @@ create() {
     )
     [[ -n "$DATE_NAME" ]] && run_args+=(--key-name "$DATE_NAME")
     [[ -n "$INSTANCE_PROFILE_NAME" ]] && run_args+=(--iam-instance-profile "Name=$INSTANCE_PROFILE_NAME")
+
+    tunnel_prepare
+
+    # same user-data for every instance of the batch - it only carries the parameter's name
+    local user_data_file=""
+    if [[ -n "$TUNNEL_PARAM" ]]; then
+        user_data_file=$(mktemp)
+        { echo "#!/bin/bash"; echo "set -e"; tunnel_commands; } > "$user_data_file"
+        run_args+=(--user-data "file://$user_data_file")
+    fi
 
     for i in $(seq 1 "$COUNT"); do
         INSTANCE_NAME="${NAME}-${ENV_TYPE}-${i}"
@@ -89,9 +150,22 @@ create() {
         statefile
     done
 
+    [[ -n "$user_data_file" ]] && rm -f "$user_data_file"
+
+    if [[ -n "$RESOURCE_GROUP_NAME" ]]; then
+        {
+            echo
+            echo "# resource group for Role=$ROLE, Environment=$ENV_TYPE"
+            echo "export RESOURCE_GROUP_NAME=\"$RESOURCE_GROUP_NAME\""
+        } >> "$STATE_FILE"
+    fi
+
     echo
     echo "========================================"
     echo "$COUNT instance(s) launched from $AMI_ID under '$NAME' ($ENV_TYPE, tier=$TIER)"
+    [[ -n "$RESOURCE_GROUP_NAME" ]] && echo "Resource group: $RESOURCE_GROUP_NAME (SSM target: Key=resource-groups:Name,Values=$RESOURCE_GROUP_NAME)"
+    [[ -n "$TUNNEL_PARAM" ]] && \
+    echo "Tunnel: cloudflared on each, token from $TUNNEL_PARAM - set the public hostname's service to http://localhost:80"
     echo "========================================"
 }
 
@@ -104,6 +178,9 @@ delete() {
                    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
         --query 'Reservations[*].Instances[*].InstanceId' \
         --output text)
+
+    # the batch's tunnel token (default path only) and its read policy go with it
+    tunnel_delete_param
 
     if [[ -z "$INSTANCE_IDS" ]]; then
         echo "no matching instances"

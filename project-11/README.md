@@ -1,14 +1,15 @@
-# project-11 — unified run.sh: keys, network, ssm, instances, s3, ami, egress
+# project-11 — unified run.sh: keys, network, ssm, instances, s3, ami, egress, egress-balancer
 
 A single dispatcher instead of one script per concern: `run.sh <keys|network|ssm|instances|s3|
-ami|instance-ami|egress> [args] {create|delete}` sources the matching `manage_*.sh` fragment,
-all of them sharing one Purpose-tagged state log at `state/$PURPOSE.env`. This started as a
-leaner, flatter alternative to `project-9/agent-keys` plus a now-retired `project-10` (separate
-vpc-network/ssm-manage/security-groups scripts, each with their own state) — same underlying
-AWS calls, one entry point and one state file instead of several separate ones. Three of
-project-10's standalone security-group utilities (`add-rule.sh`, `list-rules.sh`,
-`revoke-rule.sh` — see below) moved here rather than disappearing with it, since this project's
-intentionally-empty security groups still need them.
+ami|instance-ami|egress|egress-balancer> [args] {create|delete}` sources the matching
+`manage_*.sh` fragment, all of them sharing one Purpose-tagged state log at
+`state/$PURPOSE.env`. This started as a leaner, flatter alternative to `project-9/agent-keys`
+plus a now-retired `project-10` (separate vpc-network/ssm-manage/security-groups scripts, each
+with their own state) — same underlying AWS calls, one entry point and one state file instead
+of several separate ones. Three of project-10's standalone security-group utilities
+(`add-rule.sh`, `list-rules.sh`, `revoke-rule.sh` — see below) moved here rather than
+disappearing with it, since this project's intentionally-empty security groups still need
+them.
 
 ```bash
 cp wrapper/config/.env.example wrapper/config/.env   # fill in the creator credentials, once
@@ -23,6 +24,8 @@ export PURPOSE=testing
 ./run.sh instance-ami myapp production 2 create   # launch instances from it
 TIER=egress ./run.sh ami gw egress-gateway create   # bake the NAT-instance AMI (see "egress" below)
 ./run.sh egress gw create                  # launch it into its own tier, relay the app tier through it
+TIER=egress ./run.sh ami lb egress-balancer create  # or: NAT + nginx load balancer in one AMI (see below)
+BACKEND_NAME='myapp-production-*' ./run.sh egress-balancer lb create
 ```
 
 Every `create` appends to `state/testing.env` — `keys`/`network`/`ssm` write flat `export`
@@ -64,6 +67,43 @@ tagged with exactly those two to be picked up by that fleet-wide target:
 ```bash
 ROLE=app-server ENVIRONMENT=production ./run.sh instances web 2 create
 ```
+
+## `run.sh ssm {create|delete}`
+
+`create` wraps `$ROLE_NAME` (default `jenkins-role`, the existing role from
+`project-8/aws-perm-generator`) into `ssm-instance-profile-$PURPOSE` — this is what every other
+`create` above attaches via `INSTANCE_PROFILE_NAME`, so run it once per `PURPOSE` before
+launching anything. Idempotent: re-running it when the profile already exists reuses it instead
+of failing on `EntityAlreadyExists`.
+
+Set `DEPLOY_ARTIFACT_BUCKET` to also grant `$ROLE_NAME` a scoped `s3:GetObject` on that bucket
+(inline policy `deploy-artifact-read-$PURPOSE`) — for a deploy pipeline whose instances pull
+their own deploy script or build artifact out of S3 with their own instance profile, instead of
+that bucket's read access having to be granted to the shared role by hand:
+
+```bash
+DEPLOY_ARTIFACT_BUCKET=testing-node-app-142369633239 ./run.sh ssm create
+```
+
+Safe to re-run with a different bucket (`put-role-policy` overwrites the same-named policy
+rather than stacking). `delete` removes this policy the same way it already removes the
+Cloudflare-tunnel ones, without touching the shared role itself.
+
+**If SSM "Default Host Management Configuration" (Quick Setup) is enabled on the account**,
+granting `$ROLE_NAME` alone may not be enough. Symptom: `aws s3 cp` against the exact same
+object works fine from an interactive `aws ssm start-session` shell, but the identical command
+dispatched via `aws ssm send-command`/Run Command still gets `403 Forbidden` on `HeadObject` —
+even with a working IAM instance profile, no bucket policy, no KMS involved, `iam
+simulate-principal-policy` saying `allowed`, and no VPC-endpoint issue. Root cause: Run
+Command executions on an account with Default Host Management on can resolve permissions
+through the Quick-Setup-created `AWS-QuickSetup-SSM-DefaultEC2MgmtRole-<region>` role rather
+than (or in addition to) the instance's own attached instance profile — an interactive session
+doesn't go through that path, which is why only the dispatched command fails. If you hit this,
+the same `DEPLOY_ARTIFACT_BUCKET`-style grant needs to go on that Quick Setup role too, not just
+`$ROLE_NAME`. Check whether Default Host Management is on via Systems Manager → Fleet Manager
+in the console (or look for `AWS-QuickSetup-SSM-*` roles in IAM, as here) before spending time
+on bucket policies, KMS, or VPC endpoints chasing a Run-Command-only 403 that an interactive
+session doesn't reproduce.
 
 ## `run.sh s3 <name> {create|delete}`
 
@@ -127,14 +167,19 @@ an install link if either is missing; `delete` needs neither). Packer generates 
 ephemeral ed25519 keypair for each build and discards it afterward — the builder's SSH access
 never depends on, or extends, anything from `run.sh keys`.
 
-**The tier's security group needs an inbound rule for port 22**, since Packer connects over
-plain SSH rather than through SSM — `manage_network.sh` creates all four tiers with zero
-ingress rules, so this is the most likely first thing to trip up a cold start. `create` checks
-for one and warns (doesn't block, since a broader rule or a different exact match could still
-be fine) if it doesn't find an exact port-22 rule on the tier's SG:
+**SSH to the builder is opened automatically.** Packer connects over plain SSH rather than
+through SSM, and `manage_network.sh` creates all four tiers with zero ingress rules. So by
+default (`BUILD_SG=temporary`) the builder doesn't use the tier's SG at all. Packer creates a
+throwaway SG that allows tcp/22 only from the public IP of the machine running `packer build`
+(`temporary_security_group_source_public_ip`), and deletes it together with the builder. There
+is nothing to open by hand, and the shared tier SGs are never modified.
+
+`BUILD_SG=tier` restores the old behaviour: the builder runs in the tier's own SG, which must
+then already allow port 22. `create` warns if it finds no exact port-22 rule there:
 
 ```bash
 ./add-rule.sh --sg <sg-id> --direction ingress --protocol tcp --port 22 --cidr <your-ip>/32
+BUILD_SG=tier ./run.sh ami myapp production create      # add-rule.sh only needed with BUILD_SG=tier
 ```
 
 An SSM-only alternative exists (Packer's `ssh_interface = "session_manager"`) that would avoid
@@ -157,8 +202,8 @@ the flag today.
 to a NAT instance by default, once one's been created. AWS's 1:1 NAT for a public IP only works
 if the subnet's own route table sends `0.0.0.0/0` to the Internet Gateway directly; if it's been
 pointed at an egress gateway instead, the builder's public IP is unreachable and Packer's SSH
-connection just hangs, identically to a missing port-22 rule. `create` checks the tier's route
-table and warns (same non-blocking treatment as the port-22 check) if it doesn't find a route to
+connection just hangs. `create` checks the tier's route
+table and warns (non-blocking) if it doesn't find a route to
 an `igw-*` target. Build in a tier that's never relayed instead — `bastion` or `egress` are both
 safe once an egress gateway exists (`RELAY_SUBNET_IDS` only ever defaults to the app subnet):
 
@@ -180,13 +225,110 @@ rewrite — it only ever reads an `AMI_..._ID` out of state, agnostic to how tha
 ./run.sh instance-ami myapp production 1 delete   # <count> only matters for create
 ```
 
+**Resource group for SSM targeting.** If `ROLE` is set, `create` also ensures an [AWS Resource
+Group](https://docs.aws.amazon.com/ARG/latest/userguide/welcome.html) exists — a tag-based
+query, `Role=$ROLE` + `Environment=$ENV_TYPE`, named `${ROLE}-${ENV_TYPE}` by default (override
+with `RESOURCE_GROUP_NAME`). A deploy pipeline can then target
+`Key=resource-groups:Name,Values=<group>` on `aws ssm send-command` instead of repeating the
+same two literal tag filters in every script/Jenkinsfile — one source of truth for "what is
+`app-server`/`production`" instead of a string duplicated wherever something needs to reach
+those instances. The query is static once created (`get-group` first, so a second `create`
+is a no-op) and membership is dynamic — any instance matching those two tags shows up
+automatically, no per-instance registration step, no update needed when a batch relaunches:
+
+```bash
+ROLE=app-server ./run.sh instance-ami myapp production 2 create
+# -> resource group app-server-production (Role=app-server, Environment=production)
+aws ssm send-command --targets "Key=resource-groups:Name,Values=app-server-production" ...
+```
+
+`delete` does not remove the resource group — it's a shared, non-destructive tag query that
+other batches under the same `ROLE`/`ENV_TYPE` may still rely on; delete it by hand
+(`aws resource-groups delete-group --group-name <group>`) once nothing targets it anymore.
+Whoever runs `run.sh instance-ami` needs `resource-groups:CreateGroup` and
+`resource-groups:GetGroup` in addition to the EC2 permissions it already needed, and `jq` on
+PATH (same prerequisite `ami create` already has) — `ResourceQuery.Query` is a plain string
+field holding *escaped* JSON, not a nested object, and `jq`'s `tojson` is what builds that
+double-encoding correctly instead of hand-escaping it.
+
+**Cloudflare Tunnel on app instances.** For an image that ships `cloudflared` switched off
+(`ami-scripts/bun_cloudflared.sh`), pass the tunnel token on `create`, the same way as for
+`egress`/`egress-balancer`:
+
+```bash
+./run.sh ami myapp bun_cloudflared create
+read -rs CLOUDFLARE_TUNNEL_TOKEN && export CLOUDFLARE_TUNNEL_TOKEN
+./run.sh instance-ami myapp bun_cloudflared 2 create
+unset CLOUDFLARE_TUNNEL_TOKEN
+```
+
+This works the same way as the egress tunnel option: `lib_cloudflare_tunnel.sh`. The token is
+stored as a SecureString at `/<purpose>/app/<name>-<env-type>/cloudflare-tunnel-token` (or reuse
+one with `CLOUDFLARE_TUNNEL_PARAM`). The instance role gets an inline read policy for exactly
+that parameter, and each instance receives only the parameter name via user-data. All instances
+of the batch share the token, so each runs a connector for the same tunnel, and Cloudflare
+load-balances across them. `delete` removes the batch's read policy and the default-path
+parameter. Rotating the token means storing a new one and relaunching the batch, since
+`instance-ami` has no `sync`. Passing a token for an image without `cloudflared` (e.g. plain
+`bun.sh`) stores and grants it, but the user-data step then fails on the box. The app itself is
+unaffected.
+
+**Settings for the provision script: `PROVISION_ENV`.** Space-separated `KEY=VALUE` pairs are
+exported to the script on the builder (Packer `environment_vars`) - for per-build choices like
+where to fetch the app from. Not for secrets (they'd sit on this build's command line): a script
+that needs one reads it from SSM itself, with the builder's instance profile.
+
+### The accounting suite on one Docker host (`ami-scripts/docker.sh`)
+
+Bakes [full-stackapps](https://github.com/zssvaidar/full-stackapps) - PostgreSQL, Keycloak, the
+Spring/Laravel/Django APIs and the React app - into one image, with **TLS terminated on the
+instance** by a Caddy container (Let's Encrypt): `https://<host>/` app, `/api/*` APIs, `/auth`
+Keycloak; only :80/:443 are published. Images are built during the bake, so instances boot
+straight into `docker compose up`; each instance generates its own secrets on first boot.
+
+```bash
+# 1. source: the repo is private - hand the builder a tarball in S3 it may read
+git -C ../full-stackapps archive --format=tar.gz -o /tmp/app.tar.gz master
+aws s3 cp /tmp/app.tar.gz s3://<bucket>/accounting/app.tar.gz
+DEPLOY_ARTIFACT_BUCKET=<bucket> ./run.sh ssm create      # instance profile may s3:GetObject there
+
+# 2. bake - a tier that routes to the IGW, enough RAM for the Java/PHP/JS builds
+PROVISION_ENV="APP_SOURCE=s3://<bucket>/accounting/app.tar.gz" \
+    TIER=bastion INSTANCE_TYPE=t3.large ./run.sh ami web docker create
+
+# 3. launch, open 80/443 (Let's Encrypt validates over them), give it a stable public IP
+TIER=bastion INSTANCE_TYPE=t3.large ./run.sh instance-ami web docker 1 create
+for port in 80 443; do
+    ../project-10/security-groups/scripts/add-rule.sh --sg <bastion-sg> --direction ingress \
+        --protocol tcp --port $port --cidr 0.0.0.0/0
+done
+./connect.sh attach web-docker-1          # Elastic IP - keep it, DNS will point at it
+
+# 4. DNS: A record acct.example.com -> that IP. Then, on the instance:
+./connect.sh session web-docker-1
+sudo accounting set PUBLIC_HOST=acct.example.com ACME_EMAIL=ops@example.com
+```
+
+Until step 4 the instance serves `https://<its IP>/` with a self-signed certificate. Git instead
+of S3 also works: `APP_SOURCE=https://<forgejo>/<owner>/full-stackapps.git` plus
+`APP_GIT_TOKEN_PARAM=/<path>` naming an SSM SecureString with a read-only token (the builder's
+instance profile needs `ssm:GetParameter` on it). On the instance, `accounting` is the one
+command: `status`, `logs [service]`, `set KEY=VALUE`, `credentials` (Keycloak admin password),
+`up`/`down`; settings live in `/etc/accounting/accounting.env`, generated secrets in
+`/etc/accounting/secrets.env`. Keycloak's admin console answers only from private ranges by
+default - open it through an SSM port-forward, or `accounting set ADMIN_ALLOW_CIDRS="private_ranges
+<your-ip>/32"`. Demo users are not imported (`accounting set DEMO_USERS=yes` before the first
+start keeps them, with this instance's own password from `accounting credentials`).
+See [full-stackapps' deploy/README.md](https://github.com/zssvaidar/full-stackapps/blob/master/deploy/README.md)
+for the routing and why TLS ends at Caddy.
+
 `ami delete` finds every AMI tagged with that exact `Purpose`/`Name`/`Environment`, deregisters
 each one, and deletes its backing snapshot(s) — looked up *before* deregistering, since an
 image's metadata (and the snapshot IDs in it) disappears the moment it's deregistered. This
 side is unchanged from before Packer: Packer builds images, it doesn't manage teardown of what
 it built, so cleanup stays plain `aws` CLI, same as the rest of this project.
 
-## `run.sh egress <name> {create|delete}`
+## `run.sh egress <name> {create|sync|delete}`
 
 A small public EC2 instance acting as a self-managed NAT instance — the cheap, DIY version of a
 NAT Gateway. `manage_network.sh`'s app/db subnets have a route to the Internet Gateway already
@@ -254,6 +396,229 @@ finally deletes its security group:
 only exists in `$STATE_FILE` after a fresh `run.sh network create`. A gateway already running
 under the old `TIER=bastion` default keeps working right where it is; there's nothing to
 migrate unless you tear the whole network down and rebuild it.
+
+### HTTPS on `egress`: inbound passthrough
+
+A plain `egress` gateway has no web server — outbound HTTPS from the app tier already works
+through it like any other traffic. What it can optionally do is accept **inbound** HTTPS on its
+public IP and pass the raw TCP stream to one app instance, which terminates TLS itself (its
+own cert, e.g. certbot on the app box or a Cloudflare origin cert). No certificate ever lives on
+the gateway. Set either variable to turn it on:
+
+```bash
+HTTPS_BACKEND_NAME='myapp-production-*' ./run.sh egress gw create   # first running match
+HTTPS_BACKEND_IP=10.0.1.23 ./run.sh egress gw sync                  # re-point after a relaunch
+HTTPS_BACKEND_IP=none ./run.sh egress gw sync                       # turn it off again
+```
+
+- The image's NAT script (`ami-scripts/egress-gateway.sh`) reads `/etc/egress-gateway/https-forward`
+  (`ip:port`) and adds an nftables `dnat` for tcp/443 **addressed to the gateway itself**
+  (`fib daddr type local`). That matters: the relayed app tier's own outbound HTTPS arrives on
+  the same interface with dport 443 and must not be hijacked. An empty file means no prerouting
+  chain at all, the same as before. **Rebuild the AMI** (`TIER=egress ./run.sh ami gw egress-gateway create`)
+  to get this: images baked before it ignore the file.
+- The DNAT'd connection is masqueraded like everything else leaving the box, so the backend
+  replies to the gateway. This works however the backend's subnet routes, but the backend sees the
+  gateway's private IP rather than the client's (there's no `X-Forwarded-For` in a TLS stream).
+  Use `egress-balancer` if you need the client IP or more than one backend.
+- `create` writes the target via user-data. `sync` re-resolves it and pushes it over SSM, which needs
+  `run.sh ssm create`'s instance profile. Both add tcp/443 from `HTTPS_INGRESS_CIDR` (default
+  `0.0.0.0/0`) on the gateway's SG, and tcp/`HTTPS_BACKEND_PORT` (default 443) **from the gateway's
+  SG** on `HTTPS_BACKEND_SG` (default `$APP_SG`). `delete` revokes rules that reference the
+  gateway's SG before deleting it.
+
+### Cloudflare Tunnel on `egress` / `egress-balancer`
+
+Both AMIs ship `cloudflared`, switched off. Pass a tunnel token once and the manager stores it in
+**SSM Parameter Store as a SecureString**. The instance then fetches it itself every time
+cloudflared starts:
+
+```bash
+read -rs CLOUDFLARE_TUNNEL_TOKEN && export CLOUDFLARE_TUNNEL_TOKEN    # keeps it out of shell history
+
+./run.sh egress-balancer lb create     # or sync on a running one; same for `egress gw`
+# -> stored at /testing/egress-balancer/lb/cloudflare-tunnel-token, cloudflared started
+
+unset CLOUDFLARE_TUNNEL_TOKEN
+CLOUDFLARE_TUNNEL_TOKEN=<new> ./run.sh egress-balancer lb sync       # rotate: overwrite + restart
+CLOUDFLARE_TUNNEL_PARAM=none  ./run.sh egress-balancer lb sync       # stop the tunnel
+CLOUDFLARE_TUNNEL_PARAM=/shared/cf-token ./run.sh egress gw create   # reuse an already-stored token
+```
+
+- **Where the token lives.** It is written to `/<purpose>/<egress-gateway|egress-balancer>/<name>/cloudflare-tunnel-token`
+  (override with `CLOUDFLARE_TUNNEL_PARAM`) via a 0600 temp file, so it never appears in `ps`.
+  The token is kept out of the AMI, the user-data and the SSM command history: the instance only
+  ever receives the parameter's *name*. The instance's
+  `cloudflare-tunnel.service` reads the value with `aws ssm get-parameter --with-decryption` at
+  every start, and hands it to cloudflared as `TUNNEL_TOKEN` in its environment, never on disk
+  and never on a command line. `delete` removes the parameter if it's at the default path. A
+  parameter you named yourself is left alone, since it may be shared.
+- **Read access is granted automatically.** On every `create`/`sync` that sets a tunnel, the
+  manager attaches an inline policy to the role behind the instance profile (`jenkins-role` by
+  default, looked up from the profile itself). The policy allows `ssm:GetParameter` on exactly
+  that one parameter's ARN and nothing wider. It's named `cloudflare-tunnel-<purpose>-<egress-gateway|egress-balancer>-<name>`,
+  so each gateway or balancer has its own. Re-running it is harmless (`put-role-policy`
+  overwrites). It is re-pointed when `CLOUDFLARE_TUNNEL_PARAM` changes, and removed by
+  `CLOUDFLARE_TUNNEL_PARAM=none`, by that instance's `delete`, and by `run.sh ssm delete`
+  (which removes only this Purpose's `cloudflare-tunnel-*` policies, never the shared role).
+  Without an instance profile, `create`/`sync` refuses before storing anything. The default
+  `aws/ssm` key needs no KMS grant. A parameter you encrypted yourself with a customer-managed
+  key also needs `kms:Decrypt` on that key, which isn't added for you. IAM changes can take a
+  few seconds to apply, so the tunnel service retries every 10s until they do. Whoever runs
+  `run.sh` needs `ssm:PutParameter`, `ssm:DescribeParameters`, `iam:GetInstanceProfile`,
+  `iam:PutRolePolicy` and `iam:DeleteRolePolicy`.
+- **Where traffic goes** is set on the tunnel's public hostname in the Cloudflare dashboard (a
+  token-run tunnel takes its routing from there, not from the instance):
+  - `egress-balancer`: `http://localhost:8080`. That's a loopback-only nginx listener just for
+    the tunnel. It sets the real visitor IP from `CF-Connecting-IP` (trusted only there) and
+    sends `X-Forwarded-Proto: https` to the app. Don't use `:80`: it 301s to https when
+    `HTTPS_DOMAINS` is on, and the tunnel would loop.
+  - `egress`: an app instance directly, e.g. `http://10.0.1.23:80`. The gateway reaches the app
+    tier over the VPC like anything else. The app's SG must allow that port from the gateway's
+    SG (not added automatically).
+- **With a tunnel you don't need public ingress or Let's Encrypt.** Cloudflare terminates HTTPS
+  at its edge, and cloudflared only makes outbound connections. You can leave `HTTPS_DOMAINS`
+  unset and narrow `LB_INGRESS_CIDR`. The public IP stays, because the NAT (and cloudflared
+  itself) needs it for outbound traffic.
+- **Rebuild both AMIs** to get `cloudflared`. Images built before this don't have it.
+
+## `run.sh egress-balancer <name> {create|sync|delete}`
+
+The `egress` NAT instance with an nginx HTTP load balancer on the same box — one public
+instance in the egress tier that both relays the app tier's outbound traffic *and* spreads
+inbound HTTP across the app-tier instances. It's a separate AMI (`ami-scripts/egress-balancer.sh`,
+env-type `egress-balancer`) and a separate manager (`manage_egress_balancer.sh`) rather than a
+flag on `egress`: its own `Role=egress-balancer` tag, SG, route table and `EGRESS_BALANCER_<NAME>_*`
+state keys, so a plain NAT gateway image and a balancer image are baked, launched, replaced and
+torn down independently.
+
+```bash
+TIER=egress ./run.sh ami lb egress-balancer create           # bake it (Packer opens SSH itself)
+./run.sh instance-ami myapp production 3 create              # the app instances to balance across
+BACKEND_NAME='myapp-production-*' ./run.sh egress-balancer lb create
+curl http://<public-ip>/lb-health                            # "ok backends=3"
+curl http://<public-ip>/                                     # round-robined across the 3
+
+./run.sh instance-ami myapp production 2 create              # scaled out? re-point without relaunching:
+BACKEND_NAME='myapp-production-*' ./run.sh egress-balancer lb sync
+./run.sh egress-balancer lb delete
+./run.sh ami lb egress-balancer delete                       # the AMI is its own lifecycle
+```
+
+**The image** is `egress-gateway.sh`'s NAT setup verbatim (IP forwarding, RFC1918-only
+forward chain, boot-time systemd unit) plus nginx. The backend list can't be baked in — the app
+instances don't exist at build time and their IPs change on every relaunch — so nginx's config
+is *rendered* on the instance by `/usr/local/sbin/egress-balancer-render.sh` from two plain files:
+`/etc/egress-balancer/backends` (one `host:port` per line) and `/etc/egress-balancer/method`
+(`round_robin`/`least_conn`/`ip_hash`). The render script rejects anything that isn't strictly
+`host:port`, `nginx -t`s the result, rolls back to the previous config on failure, then reloads.
+With no backends it serves a clean `503` rather than failing to start; `/lb-health` is answered
+by nginx itself either way. The Packer build smoke-tests all three states (empty → 503, a local
+throwaway backend → proxied, back to empty) before snapshotting.
+
+`create`:
+1. Resolves backends: `BACKEND_IPS` (space-separated) if set, otherwise every *running* instance
+   in `$VPC_ID` tagged `Purpose=$PURPOSE` with `Name` matching `BACKEND_NAME` (wildcards ok —
+   `instance-ami` names its batch `<name>-<env-type>-<i>`). Neither set is fine: it launches
+   answering 503 until a `sync`.
+2. Creates a dedicated SG: all traffic from the VPC CIDR (NAT relay, same as `egress`) plus
+   `tcp/80` from `LB_INGRESS_CIDR` (default `0.0.0.0/0`). Adds `tcp/$BACKEND_PORT` (default 80)
+   **from that SG** onto `BACKEND_SG` (default `$APP_SG`) — `manage_network.sh`'s tier SGs are
+   empty, so without this the backends would drop the balancer's connections.
+3. Launches from `AMI_<AMI_NAME>_EGRESS_BALANCER_ID` with a public IP and user-data that writes
+   the backend/method files and runs the render script at first boot; disables source/dest check.
+4. Rewires `RELAY_SUBNET_IDS` (default `$APP_SUBNET_ID`) to a new route table pointing at it, exactly
+   like `egress`. `RELAY_SUBNET_IDS=none` skips this for a pure load balancer (e.g. when a plain
+   `egress` gateway already relays the app tier). Running both against the same subnet means the
+   last `create` wins the association.
+
+To change the backend port (e.g. a Bun app on 3000 instead of 80), pass it on `sync` together
+with the backends. `sync` also opens that port on `BACKEND_SG` for the balancer, so no
+security-group edits are needed by hand:
+
+```bash
+BACKEND_NAME='myapp-bun-*' BACKEND_PORT=3000 ./run.sh egress-balancer lb sync
+```
+
+Editing `/etc/egress-balancer/backends` on the box does nothing until
+`/usr/local/sbin/egress-balancer-render.sh` runs. Restarting nginx alone keeps the old config.
+The next `sync` with `BACKEND_NAME`/`BACKEND_IPS` overwrites a hand edit anyway.
+
+`sync` pushes changes to the running balancer via `aws ssm send-command`, which needs the instance
+profile from `run.sh ssm create`. It only changes what you pass: the backend list if
+`BACKEND_NAME`/`BACKEND_IPS` is set, the method if `LB_METHOD` is set, the HTTPS settings if
+`HTTPS_DOMAINS` is set, the tunnel if `CLOUDFLARE_TUNNEL_TOKEN`/`CLOUDFLARE_TUNNEL_PARAM` is set.
+With nothing set it just re-runs the certificate step.
+
+### HTTPS on `egress-balancer`: Let's Encrypt
+
+Set `HTTPS_DOMAINS` on `create` and that's the whole setup. The balancer terminates TLS on
+:443 with a Let's Encrypt certificate it gets and renews itself (certbot, HTTP-01 webroot, so
+nginx keeps serving throughout). There's no second command:
+
+```bash
+BACKEND_NAME='myapp-production-*' HTTPS_DOMAINS=app.example.com HTTPS_EMAIL=ops@example.com \
+    ./run.sh egress-balancer lb create          # prints the public IP to point DNS at
+# point app.example.com's A record at that IP - within ~5 minutes :443 is up on its own
+curl https://app.example.com/lb-health           # "ok backends=3 https=1"
+```
+
+- **The instance waits for DNS by itself.** HTTP-01 validation needs every domain to resolve to
+  the balancer. `egress-balancer-cert.timer` checks every 5 minutes whether each domain resolves
+  to the instance's own public IP (from IMDS). That check is local, so it costs no Let's Encrypt
+  calls. As soon as DNS matches, it requests the certificate and switches :443 on. Until then it
+  serves plain HTTP. An actual failed certbot attempt backs the timer off for an hour, because
+  failed validations count against Let's Encrypt's rate limit. `sync` with no variables re-runs
+  it immediately if you don't want to wait. Behind a proxy like Cloudflare, DNS resolves to the
+  proxy instead, so set `HTTPS_DNS_CHECK=false`. It then requests right away, so DNS must
+  already reach the box.
+- **The address is the instance's own public IP** (`--associate-public-ip-address`, printed by
+  `create` and recorded as `EGRESS_BALANCER_<NAME>_PUBLIC_IP`). It stays the same across
+  reboots, but a stop/start or a `delete` + `create` gives it a new one. Update the A record when
+  that happens. The instance keeps serving its existing certificate, and for a new
+  instance the timer picks up the cert once DNS points at the new IP.
+- **:443 only appears once a certificate exists.** Until then nginx serves HTTP only, rather than
+  failing to start on missing cert files. After that, :80 answers `/lb-health` and the ACME
+  challenge path and 301-redirects everything else to https (`HTTPS_REDIRECT=false` keeps
+  proxying on :80 too).
+- **Renewal** runs from the same timer, at most twice a day. `certbot renew` is a no-op until 30
+  days before expiry, then nginx reloads with the new cert. When nothing changed, the timer
+  exits without touching nginx. Changing `HTTPS_DOMAINS` or
+  `HTTPS_STAGING` on a `sync` deletes the old certificate and issues a new one.
+- `HTTPS_STAGING=true` uses Let's Encrypt's staging CA. Its certs aren't browser-trusted, but its
+  rate limits are far higher, so use it for trial runs.
+- `create`/`sync` with HTTPS on adds tcp/443 from `LB_INGRESS_CIDR` to the balancer's SG. Port
+  80 stays open, since renewals validate over it. `HTTPS_DOMAINS=none` on `sync` turns HTTPS off
+  (serves HTTP only again). The tcp/443 rule stays until `delete`.
+
+`delete` restores routing and terminates the instance the same way `egress delete` does, then
+revokes every SG rule elsewhere in the account that references the balancer's SG (found by what
+references it now, not by trusting `BACKEND_SG`) before deleting the SG itself — AWS refuses to
+delete an SG that another rule still points at.
+
+| variable          | default                     | used for                                         |
+|-------------------|-----------------------------|--------------------------------------------------|
+| `AMI_NAME`        | `<name>`                    | which `ami ... egress-balancer` build to launch  |
+| `BACKEND_NAME`    | —                           | `Name` tag pattern of instances to balance across |
+| `BACKEND_IPS`     | —                           | explicit private IPs, overrides `BACKEND_NAME`   |
+| `BACKEND_PORT`    | `80`                        | port nginx proxies to on each backend            |
+| `BACKEND_SG`      | `$APP_SG`                   | SG that gets the "from balancer" ingress rule    |
+| `LB_METHOD`       | `round_robin`               | `round_robin` / `least_conn` / `ip_hash`         |
+| `LB_INGRESS_CIDR` | `0.0.0.0/0`                 | who may reach the listener on `:80`              |
+| `RELAY_SUBNET_IDS`| `$APP_SUBNET_ID`            | subnets NAT'd through it; `none` to skip         |
+| `HTTPS_DOMAINS`   | —                           | comma-separated; enables HTTPS, `none` disables  |
+| `HTTPS_EMAIL`     | —                           | Let's Encrypt account email (expiry notices)     |
+| `HTTPS_REDIRECT`  | `true`                      | 301 http → https once a cert exists              |
+| `HTTPS_STAGING`   | `false`                     | Let's Encrypt staging CA, for testing            |
+| `HTTPS_DNS_CHECK` | `true`                      | only request once DNS points here                |
+| `CLOUDFLARE_TUNNEL_TOKEN` | —                   | store in SSM + run cloudflared (see above)       |
+| `CLOUDFLARE_TUNNEL_PARAM` | `/<purpose>/egress-balancer/<name>/cloudflare-tunnel-token` | existing parameter, or `none` to stop |
+| `TIER`            | `egress`                    | where the balancer itself is launched            |
+
+Not built: nginx OSS active health checks (only passive: `max_fails=3 fail_timeout=10s` plus
+`proxy_next_upstream` retrying another backend on connect errors/5xx), and any HA — it's one
+instance, so it's a single point of failure for both ingress and egress, the same trade the
+DIY NAT instance already makes versus a managed ALB + NAT Gateway.
 
 ## Fixed while porting this in
 
