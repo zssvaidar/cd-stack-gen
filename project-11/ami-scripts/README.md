@@ -38,6 +38,24 @@ systemd unit(s). The app itself is the same dependency-free app as
 replace the `cat > /opt/app/server.js` block with your own deploy step (copy build output in,
 fetch from S3/git, …) once you have a real one.
 
+`nodejs_caddy.sh` is the same app as `nodejs.sh` with **Caddy** in front instead of nginx
+(same ports: Caddy on `:80` → Node on `127.0.0.1:3000`, same `node-app.service`, same build-time
+smoke test). Caddy isn't in Amazon Linux's repos, so it's installed from the official release
+tarball, pinned and sha512-verified like `docker.sh`'s plugins, and runs as an unprivileged `caddy`
+user via the upstream systemd unit. The Caddyfile serves plain HTTP on `:80`; replace `:80` with
+a public hostname to get automatic Let's Encrypt TLS on the instance itself. project-13's
+`live/shared/ami-nodejs` builds this one.
+
+`docker_vault.sh` is a Docker host running **HashiCorp Vault** in a container (`hashicorp/vault`,
+pinned by digest and pulled at build time). It's configured for S3 storage and AWS KMS
+auto-unseal, but nothing deployment-specific is baked in. At boot, `vault-render.sh` (run by
+`vault.service` before every start) reads the bucket, key ID and region from
+`/etc/vault/vault.env`, which user-data writes. It renders `vault.hcl` from that and, on first
+boot, generates a self-signed TLS certificate for the instance's private IP. The instance role
+supplies AWS credentials. `/usr/bin/vault` (on sudo's path) wraps the CLI inside the container. The
+smoke test starts the image in `-dev` mode and runs the renderer, then deletes everything it
+generated. project-13's `live/shared/ami-docker-vault` builds it, and `modules/vault` launches it.
+
 `bun.sh` is for a Bun app that has a build step producing static client assets alongside its
 server, the way [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `bun run build` emits
 `dist/public/*` next to `dist/index.js`. **There is no nginx on the instance.** Bun listens on
