@@ -161,3 +161,6 @@ anything in the original repo.
   tier (a Cloudflare Tunnel sidecar, or an Application Load Balancer) as separate `run.sh`
   verbs — reusing project-11's VPC, app-tier subnet, and egress gateway rather than a second
   network.
+- **[project-13](project-13/)** — the same ground in Terraform: an S3 state bucket and one VPC
+  per environment (dev, prod) from a shared module, each env/layer in its own state, built up
+  step by step.
