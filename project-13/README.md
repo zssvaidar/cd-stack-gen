@@ -14,7 +14,7 @@ Built step by step:
 4. Vault per env: a Docker image running Vault, S3 storage, KMS auto-unseal.
 5. **(this)** [project-14](../project-14/)'s four apps (Laravel, Spring Boot, ASP.NET Core, Go) on
    plain EC2 behind Caddy, plus a monitoring host per env (Grafana, Mimir, Loki) that Grafana
-   Alloy on every app instance ships metrics and logs to. dev only so far.
+   Alloy on every app instance ships metrics and logs to.
 
 Next: a load balancer in front of the app, then the ECS/RDS/bun-hydrate layers.
 
@@ -54,6 +54,11 @@ project-13/
     prod/nat/                 2 NAT instances, one per AZ
     prod/app/                 2 Node.js instances, one per AZ
     prod/vault/               Vault (1 instance) + its S3 bucket and KMS key
+    prod/monitoring/          Grafana + Mimir + Loki (1 instance)
+    prod/laravel/             2 instances each, one per AZ, Alloy pointed at prod/monitoring
+    prod/spring/
+    prod/csharp/
+    prod/go/
 ```
 
 Layers depend on each other only through state outputs (`terraform_remote_state`), so apply
@@ -64,9 +69,9 @@ dev network ─┬─► shared/ami-egress-gateway ─► <env> nat ─┐
              └─► shared/ami-nodejs ──────────────────────┴─► <env> app
 <env> network ─► <env> nat ─► <env> app
 
-dev network ─► shared/ami-grafana ─────────► dev monitoring ─┐
-dev network ─► shared/ami-<app> ─────────────────────────────┴─► dev <app>    (<app> = laravel, spring, csharp, go)
-dev nat ─────────────────────────────────────────────────────────┘
+dev network ─► shared/ami-grafana ───────► <env> monitoring ─┐
+dev network ─► shared/ami-<app> ─────────────────────────────┴─► <env> <app>    (<app> = laravel, spring, csharp, go)
+<env> network ─► <env> nat ──────────────────────────────────────┘
 ```
 
 ## Prerequisites
@@ -102,11 +107,14 @@ dev nat ────────────────────────
 ./run.sh prod nat apply
 ./run.sh prod app apply
 
-# project-14's apps + monitoring (dev) - images first, then monitoring, then the apps
+# project-14's apps + monitoring - images once (shared), then per env: monitoring, then the apps
 for i in grafana laravel spring csharp go; do ./run.sh shared ami-$i apply; done
 ./run.sh dev monitoring apply
 for a in laravel spring csharp go; do ./run.sh dev $a apply; done
 ./run.sh dev monitoring output     # private_ip, grafana_port_forward
+
+./run.sh prod monitoring apply
+for a in laravel spring csharp go; do ./run.sh prod $a apply; done
 ```
 
 Tear down in reverse: `app`, `nat`, then `network`. `network` can't be destroyed while
@@ -131,10 +139,11 @@ rebuild by itself. Use a new tag, or force it with
 `./run.sh shared ami-go apply -replace=module.ami.terraform_data.build`. The builders are sized per
 image: t3.medium for Spring, C# and Grafana, t3.small for Laravel and Go.
 
-`dev/monitoring` is one instance in an app subnet: Grafana on 3000, Mimir on 9009 and Loki on 3100,
-all VPC-only, with a 30 GB root volume for retention. Each `dev/<app>` layer reads its `private_ip`
+Each env gets its own monitoring host, so dev and prod data never mix. dev runs one instance per
+app, and prod runs two per app, one per AZ. `<env>/monitoring` is one instance in an app subnet: Grafana on 3000, Mimir on 9009 and Loki on 3100,
+all VPC-only, with a 30 GB root volume for retention. Each `<env>/<app>` layer reads its `private_ip`
 and writes it into `/etc/alloy/endpoint.env` through user_data, which turns that instance's Alloy
-on. Apply `dev/monitoring` before the apps. If you replace it, its IP changes, and re-applying each app
+on. Apply `<env>/monitoring` before that env's apps. If you replace it, its IP changes, and re-applying each app
 layer replaces those instances too, since everything here is immutable. To reach Grafana, run the
 `grafana_port_forward` output command locally, then open http://localhost:3000 and log in as
 `admin`. The password is in `/etc/grafana/admin.env` on the monitoring instance (read it over an

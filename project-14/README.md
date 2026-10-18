@@ -68,7 +68,7 @@ behind Caddy on `:80`. It smoke-tests the app before the snapshot.
 | go-app | `go.sh` | `run.sh ami go-app go create` |
 
 [project-13](../project-13/) bakes and launches them with Terraform:
-`live/shared/ami-<app>` and `live/dev/<app>`, plus `live/dev/monitoring` for Grafana.
+`live/shared/ami-<app>` and `live/{dev,prod}/<app>`, plus `live/{dev,prod}/monitoring` for Grafana.
 
 By default they fetch this repo from GitHub at `master`. Override that with
 `PROVISION_ENV="APP_REF=<branch>"`, or give an `APP_SOURCE=s3://...` tarball or an
