@@ -41,3 +41,9 @@ Copy to `config/.env` (gitignored) and fill in the creator credentials:
 AWS_ACCESS_KEY_ID_CREATOR=
 SECRET_ACCESS_KEY_CREATOR=
 ```
+
+## `<env>/<app>/.env`
+
+Per-app secrets for [project-15](../../project-15/)'s `run.sh secrets <env> <app> push`, which stores
+each variable in SSM Parameter Store. Gitignored (`.gitignore` here). Only the `.env.example`
+templates next to them are committed: copy one to `.env` and fill it in.

@@ -1,0 +1,5 @@
+# Per-app secrets that project-15's manage_secrets pushes to SSM: <env>/<app>/.env.
+# Never committed - only the .env.example templates are.
+*/*/.env
+*/*/.env.*
+!*/*/.env.example

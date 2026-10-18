@@ -167,3 +167,7 @@ anything in the original repo.
 - **[project-14](project-14/)** — four minimal web apps (Laravel, Spring Boot, ASP.NET Core, Go),
   each with liveness/readiness health endpoints and a production, non-root `Dockerfile` on port
   8080, ready to push to ECR and run behind an ALB on ECS Fargate.
+- **[project-15](project-15/)** — app secrets: `run.sh secrets <env> <app> push` stores each
+  variable of a gitignored `project-9/wrapper/<env>/<app>/.env` as an SSM `SecureString` at
+  `/cd-stack-gen/<env>/<app>/<KEY>`, for ECS task definitions, Terraform and instances to
+  reference by name; `pull` brings them back for local docker compose.
