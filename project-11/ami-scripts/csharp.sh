@@ -65,16 +65,16 @@ retry_pkg dnf install -y libicu git tar
 # Source
 # --------------------------------------------------
 
-SRC=/tmp/app-src
+SRC=/var/tmp/app-src
 rm -rf "$SRC"
 mkdir -p "$SRC"
 
 case "$APP_SOURCE" in
     s3://*)
         log "fetching $APP_SOURCE"
-        aws s3 cp --only-show-errors "$APP_SOURCE" /tmp/app.tar.gz
-        tar -xzf /tmp/app.tar.gz -C "$SRC"
-        rm -f /tmp/app.tar.gz
+        aws s3 cp --only-show-errors "$APP_SOURCE" /var/tmp/app.tar.gz
+        tar -xzf /var/tmp/app.tar.gz -C "$SRC"
+        rm -f /var/tmp/app.tar.gz
         ;;
     https://*)
         log "cloning $APP_SOURCE @ $APP_REF"
@@ -99,7 +99,8 @@ esac
 
 
 # --------------------------------------------------
-# Build: SDK into /tmp (build-only), publish self-contained for this CPU.
+# Build: SDK into /var/tmp (build-only; on disk - /tmp is a RAM-backed tmpfs on Amazon Linux
+# 2023 and the SDK alone would fill it on a small builder), publish self-contained for this CPU.
 # --------------------------------------------------
 
 DOTNET_CHANNEL="${DOTNET_CHANNEL:-10.0}"
@@ -110,15 +111,15 @@ case "$(uname -m)" in
 esac
 
 log "installing .NET SDK $DOTNET_CHANNEL (build only)"
-curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
-bash /tmp/dotnet-install.sh --channel "$DOTNET_CHANNEL" --install-dir /tmp/dotnet
+curl -fsSL https://dot.net/v1/dotnet-install.sh -o /var/tmp/dotnet-install.sh
+bash /var/tmp/dotnet-install.sh --channel "$DOTNET_CHANNEL" --install-dir /var/tmp/dotnet
 
 log "building $APP_SUBDIR for $RID"
 mkdir -p "$APP_DIR"
 (
     cd "$SRC/$APP_SUBDIR"
-    export DOTNET_ROOT=/tmp/dotnet PATH=/tmp/dotnet:$PATH HOME=/tmp/dotnet-home \
-        DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 NUGET_PACKAGES=/tmp/nuget
+    export DOTNET_ROOT=/var/tmp/dotnet PATH=/var/tmp/dotnet:$PATH HOME=/var/tmp/dotnet-home \
+        DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 NUGET_PACKAGES=/var/tmp/nuget
     dotnet publish -c Release -r "$RID" --self-contained true -o "$APP_DIR"
 )
 echo "$APP_SOURCE @ $APP_REF ($APP_SUBDIR), built $(date -u +%FT%TZ)" > "$APP_DIR/.source"
@@ -260,8 +261,8 @@ LOG_UNITS="$APP_NAME.service|caddy.service" \
 # Drop the SDK and sources - the self-contained publish carries its own runtime.
 # --------------------------------------------------
 
-rm -rf /tmp/dotnet /tmp/dotnet-install.sh
-rm -rf "$SRC" /tmp/dotnet-home /tmp/nuget
+rm -rf /var/tmp/dotnet /var/tmp/dotnet-install.sh
+rm -rf "$SRC" /var/tmp/dotnet-home /var/tmp/nuget
 
 
 # --------------------------------------------------

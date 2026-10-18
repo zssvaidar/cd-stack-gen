@@ -110,27 +110,27 @@ EOF
 # Composer: official installer, verified against its published signature. Build-only.
 log "installing composer (build only)"
 expected=$(curl -fsSL https://composer.github.io/installer.sig)
-curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php
-actual=$(php -r "echo hash_file('sha384', '/tmp/composer-setup.php');")
+curl -fsSL https://getcomposer.org/installer -o /var/tmp/composer-setup.php
+actual=$(php -r "echo hash_file('sha384', '/var/tmp/composer-setup.php');")
 [[ "$expected" == "$actual" ]] || { echo "laravel.sh: composer installer checksum mismatch" >&2; exit 1; }
-php /tmp/composer-setup.php --quiet --install-dir=/tmp --filename=composer
-rm -f /tmp/composer-setup.php
+php /var/tmp/composer-setup.php --quiet --install-dir=/var/tmp --filename=composer
+rm -f /var/tmp/composer-setup.php
 
 
 # --------------------------------------------------
 # Source
 # --------------------------------------------------
 
-SRC=/tmp/app-src
+SRC=/var/tmp/app-src
 rm -rf "$SRC"
 mkdir -p "$SRC"
 
 case "$APP_SOURCE" in
     s3://*)
         log "fetching $APP_SOURCE"
-        aws s3 cp --only-show-errors "$APP_SOURCE" /tmp/app.tar.gz
-        tar -xzf /tmp/app.tar.gz -C "$SRC"
-        rm -f /tmp/app.tar.gz
+        aws s3 cp --only-show-errors "$APP_SOURCE" /var/tmp/app.tar.gz
+        tar -xzf /var/tmp/app.tar.gz -C "$SRC"
+        rm -f /var/tmp/app.tar.gz
         ;;
     https://*)
         log "cloning $APP_SOURCE @ $APP_REF"
@@ -169,8 +169,8 @@ echo "$APP_SOURCE @ $APP_REF ($APP_SUBDIR), built $(date -u +%FT%TZ)" > "$APP_DI
 log "composer install (no dev)"
 (
     cd "$APP_DIR"
-    export COMPOSER_HOME=/tmp/composer-home COMPOSER_ALLOW_SUPERUSER=1
-    /tmp/composer install --no-dev --optimize-autoloader --no-interaction --no-progress --prefer-dist
+    export COMPOSER_HOME=/var/tmp/composer-home COMPOSER_ALLOW_SUPERUSER=1
+    /var/tmp/composer install --no-dev --optimize-autoloader --no-interaction --no-progress --prefer-dist
 )
 
 chown -R root:root "$APP_DIR"
@@ -415,7 +415,7 @@ LOG_UNITS="php-fpm.service|caddy.service|$APP_NAME-init.service" \
 # Drop Composer and the sources.
 # --------------------------------------------------
 
-rm -rf "$SRC" /tmp/composer /tmp/composer-home
+rm -rf "$SRC" /var/tmp/composer /var/tmp/composer-home
 
 
 # --------------------------------------------------

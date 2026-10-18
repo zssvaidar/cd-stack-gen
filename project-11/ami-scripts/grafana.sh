@@ -97,16 +97,16 @@ rm -rf /var/lib/grafana/grafana.db* /var/lib/mimir/* /tmp/loki
 # Source (configs only)
 # --------------------------------------------------
 
-SRC=/tmp/app-src
+SRC=/var/tmp/app-src
 rm -rf "$SRC"
 mkdir -p "$SRC"
 
 case "$APP_SOURCE" in
     s3://*)
         log "fetching $APP_SOURCE"
-        aws s3 cp --only-show-errors "$APP_SOURCE" /tmp/app.tar.gz
-        tar -xzf /tmp/app.tar.gz -C "$SRC"
-        rm -f /tmp/app.tar.gz
+        aws s3 cp --only-show-errors "$APP_SOURCE" /var/tmp/app.tar.gz
+        tar -xzf /var/tmp/app.tar.gz -C "$SRC"
+        rm -f /var/tmp/app.tar.gz
         ;;
     https://*)
         log "cloning $APP_SOURCE @ $APP_REF"

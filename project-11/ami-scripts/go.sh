@@ -63,16 +63,16 @@ retry_pkg dnf install -y golang git tar
 # Source
 # --------------------------------------------------
 
-SRC=/tmp/app-src
+SRC=/var/tmp/app-src
 rm -rf "$SRC"
 mkdir -p "$SRC"
 
 case "$APP_SOURCE" in
     s3://*)
         log "fetching $APP_SOURCE"
-        aws s3 cp --only-show-errors "$APP_SOURCE" /tmp/app.tar.gz
-        tar -xzf /tmp/app.tar.gz -C "$SRC"
-        rm -f /tmp/app.tar.gz
+        aws s3 cp --only-show-errors "$APP_SOURCE" /var/tmp/app.tar.gz
+        tar -xzf /var/tmp/app.tar.gz -C "$SRC"
+        rm -f /var/tmp/app.tar.gz
         ;;
     https://*)
         log "cloning $APP_SOURCE @ $APP_REF"
@@ -98,14 +98,15 @@ esac
 
 # --------------------------------------------------
 # Build. GOTOOLCHAIN=auto: if Amazon Linux's golang is older than go.mod asks for, go fetches
-# the right toolchain from proxy.golang.org. Caches go to /tmp, not root's home.
+# the right toolchain from proxy.golang.org. Build files go to /var/tmp - on disk, unlike /tmp,
+# which Amazon Linux 2023 mounts as a RAM-backed tmpfs - not root's home.
 # --------------------------------------------------
 
 log "building $APP_SUBDIR"
 mkdir -p "$APP_DIR"
 (
     cd "$SRC/$APP_SUBDIR"
-    export GOTOOLCHAIN=auto GOPATH=/tmp/gopath GOCACHE=/tmp/gocache CGO_ENABLED=0
+    export GOTOOLCHAIN=auto GOPATH=/var/tmp/gopath GOCACHE=/var/tmp/gocache CGO_ENABLED=0
     go test ./...
     go build -trimpath -ldflags="-s -w" -o "$APP_DIR/$APP_NAME" .
 )
@@ -246,7 +247,7 @@ LOG_UNITS="$APP_NAME.service|caddy.service" \
 # --------------------------------------------------
 
 retry_pkg dnf remove -y golang
-rm -rf "$SRC" /tmp/gopath /tmp/gocache
+rm -rf "$SRC" /var/tmp/gopath /var/tmp/gocache
 
 
 # --------------------------------------------------

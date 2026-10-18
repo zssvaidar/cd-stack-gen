@@ -11,7 +11,10 @@ Built step by step:
 2. Modules for baking an AMI from `ami-scripts/*.sh` and launching instances from it.
 3. Images in `shared/ami-*` (egress-gateway, nodejs), NAT instances per env, and the
    Node.js app on plain EC2 instances per env.
-4. **(this)** Vault per env: a Docker image running Vault, S3 storage, KMS auto-unseal.
+4. Vault per env: a Docker image running Vault, S3 storage, KMS auto-unseal.
+5. **(this)** [project-14](../project-14/)'s four apps (Laravel, Spring Boot, ASP.NET Core, Go) on
+   plain EC2 behind Caddy, plus a monitoring host per env (Grafana, Mimir, Loki) that Grafana
+   Alloy on every app instance ships metrics and logs to. dev only so far.
 
 Next: a load balancer in front of the app, then the ECS/RDS/bun-hydrate layers.
 
@@ -33,10 +36,20 @@ project-13/
     shared/ami-egress-gateway/  NAT image, used by every env's nat layer
     shared/ami-nodejs/        Node.js app image, used by every env's app layer
     shared/ami-docker-vault/  Docker + Vault image, used by every env's vault layer
+    shared/ami-laravel/       project-14 images (ami-scripts/<app>.sh), each used by
+    shared/ami-spring/          that app's layer in every env
+    shared/ami-csharp/
+    shared/ami-go/
+    shared/ami-grafana/       monitoring image (ami-scripts/grafana.sh), used by every env's monitoring layer
     dev/network/              dev VPC   - 10.10.0.0/16
     dev/nat/                  1 NAT instance, shared by both AZs
     dev/app/                  1 Node.js instance
     dev/vault/                Vault (1 instance) + its S3 bucket and KMS key
+    dev/monitoring/           Grafana + Mimir + Loki (1 instance)
+    dev/laravel/              1 instance each, Alloy pointed at dev/monitoring
+    dev/spring/
+    dev/csharp/
+    dev/go/
     prod/network/             prod VPC  - 10.20.0.0/16
     prod/nat/                 2 NAT instances, one per AZ
     prod/app/                 2 Node.js instances, one per AZ
@@ -50,6 +63,10 @@ them in order:
 dev network ─┬─► shared/ami-egress-gateway ─► <env> nat ─┐
              └─► shared/ami-nodejs ──────────────────────┴─► <env> app
 <env> network ─► <env> nat ─► <env> app
+
+dev network ─► shared/ami-grafana ─────────► dev monitoring ─┐
+dev network ─► shared/ami-<app> ─────────────────────────────┴─► dev <app>    (<app> = laravel, spring, csharp, go)
+dev nat ─────────────────────────────────────────────────────────┘
 ```
 
 ## Prerequisites
@@ -84,6 +101,12 @@ dev network ─┬─► shared/ami-egress-gateway ─► <env> nat ─┐
 
 ./run.sh prod nat apply
 ./run.sh prod app apply
+
+# project-14's apps + monitoring (dev) - images first, then monitoring, then the apps
+for i in grafana laravel spring csharp go; do ./run.sh shared ami-$i apply; done
+./run.sh dev monitoring apply
+for a in laravel spring csharp go; do ./run.sh dev $a apply; done
+./run.sh dev monitoring output     # private_ip, grafana_port_forward
 ```
 
 Tear down in reverse: `app`, `nat`, then `network`. `network` can't be destroyed while
@@ -95,6 +118,29 @@ use, then the action in `live/<env>/<layer>`. Anything after the action is passe
 `TF_STATE_BUCKET=...` and the region with `AWS_REGION=...` (default `ap-northeast-1`). Both
 reach every root as `TF_VAR_region`/`TF_VAR_state_bucket`; a root that reads another layer's
 outputs (`terraform_remote_state`) declares `variable "state_bucket"` to get the bucket name.
+
+## project-14's apps and monitoring
+
+The images come from project-14's AMI scripts (`ami-scripts/{laravel,spring,csharp,go,grafana}.sh`,
+see the ami-scripts README). Each one builds its app on the Packer builder from this repo's git.
+The scripts default to GitHub at `master`, and each `shared/ami-*` layer passes its `app_ref`
+variable as `APP_REF`. To bake from another branch or a tag, use
+`TF_VAR_app_ref=my-branch ./run.sh shared ami-go apply`. The ami module only rebuilds when the script,
+`app_ref`, the base AMI or the Packer template change, so a new commit on the same branch doesn't
+rebuild by itself. Use a new tag, or force it with
+`./run.sh shared ami-go apply -replace=module.ami.terraform_data.build`. The builders are sized per
+image: t3.medium for Spring, C# and Grafana, t3.small for Laravel and Go.
+
+`dev/monitoring` is one instance in an app subnet: Grafana on 3000, Mimir on 9009 and Loki on 3100,
+all VPC-only, with a 30 GB root volume for retention. Each `dev/<app>` layer reads its `private_ip`
+and writes it into `/etc/alloy/endpoint.env` through user_data, which turns that instance's Alloy
+on. Apply `dev/monitoring` before the apps. If you replace it, its IP changes, and re-applying each app
+layer replaces those instances too, since everything here is immutable. To reach Grafana, run the
+`grafana_port_forward` output command locally, then open http://localhost:3000 and log in as
+`admin`. The password is in `/etc/grafana/admin.env` on the monitoring instance (read it over an
+SSM session). The apps listen on 80, Caddy, from the VPC only. There's no load balancer yet, so
+each layer outputs the health check path a target group would use. Laravel has no RDS here, so it
+runs on the instance's own SQLite file, which is lost when the instance is replaced.
 
 ## Why this layout
 

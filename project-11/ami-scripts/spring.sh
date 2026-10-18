@@ -63,16 +63,16 @@ retry_pkg dnf install -y java-21-amazon-corretto-devel java-21-amazon-corretto-h
 # Source
 # --------------------------------------------------
 
-SRC=/tmp/app-src
+SRC=/var/tmp/app-src
 rm -rf "$SRC"
 mkdir -p "$SRC"
 
 case "$APP_SOURCE" in
     s3://*)
         log "fetching $APP_SOURCE"
-        aws s3 cp --only-show-errors "$APP_SOURCE" /tmp/app.tar.gz
-        tar -xzf /tmp/app.tar.gz -C "$SRC"
-        rm -f /tmp/app.tar.gz
+        aws s3 cp --only-show-errors "$APP_SOURCE" /var/tmp/app.tar.gz
+        tar -xzf /var/tmp/app.tar.gz -C "$SRC"
+        rm -f /var/tmp/app.tar.gz
         ;;
     https://*)
         log "cloning $APP_SOURCE @ $APP_REF"
@@ -97,16 +97,16 @@ esac
 
 
 # --------------------------------------------------
-# Build with the project's Maven wrapper (downloads Maven itself). Caches go to /tmp, not
-# root's home.
+# Build with the project's Maven wrapper (downloads Maven itself). Build files go to /var/tmp -
+# on disk, unlike /tmp, which Amazon Linux 2023 mounts as a RAM-backed tmpfs.
 # --------------------------------------------------
 
 log "building $APP_SUBDIR"
 mkdir -p "$APP_DIR"
 (
     cd "$SRC/$APP_SUBDIR"
-    export MAVEN_USER_HOME=/tmp/m2
-    sh ./mvnw -B -q -Dmaven.repo.local=/tmp/m2/repository package
+    export MAVEN_USER_HOME=/var/tmp/m2
+    sh ./mvnw -B -q -Dmaven.repo.local=/var/tmp/m2/repository package
     cp target/*.jar "$APP_DIR/$APP_NAME.jar"
 )
 echo "$APP_SOURCE @ $APP_REF ($APP_SUBDIR), built $(date -u +%FT%TZ)" > "$APP_DIR/.source"
@@ -254,7 +254,7 @@ LOG_UNITS="$APP_NAME.service|caddy.service" \
 
 retry_pkg dnf remove -y java-21-amazon-corretto-devel
 java -version 2>&1 | head -1   # the headless JRE still provides /usr/bin/java
-rm -rf "$SRC" /tmp/m2
+rm -rf "$SRC" /var/tmp/m2
 
 
 # --------------------------------------------------
