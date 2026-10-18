@@ -161,3 +161,6 @@ anything in the original repo.
   tier (a Cloudflare Tunnel sidecar, or an Application Load Balancer) as separate `run.sh`
   verbs — reusing project-11's VPC, app-tier subnet, and egress gateway rather than a second
   network.
+- **[project-14](project-14/)** — four minimal web apps (Laravel, Spring Boot, ASP.NET Core, Go),
+  each with liveness/readiness health endpoints and a production, non-root `Dockerfile` on port
+  8080, ready to push to ECR and run behind an ALB on ECS Fargate.
