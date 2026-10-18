@@ -1,5 +1,9 @@
 # Offline - mock provider, no AWS credentials.
 #   cd modules/vault && terraform init && terraform test
+#
+# Plan-only on purpose: the bucket and KMS key have prevent_destroy, so an apply run's teardown
+# (terraform test destroys what it created) would fail. override_resource makes the computed
+# values the assertions need (bucket name, key id, private IP) known at plan time.
 
 mock_provider "aws" {
   mock_data "aws_iam_policy_document" {
@@ -8,18 +12,31 @@ mock_provider "aws" {
     }
   }
 
-  mock_resource "aws_s3_bucket" {
-    defaults = {
-      bucket = "dev-vault-storage-20261018"
-      arn    = "arn:aws:s3:::dev-vault-storage-20261018"
-    }
-  }
+}
 
-  mock_resource "aws_kms_key" {
-    defaults = {
-      key_id = "11111111-2222-3333-4444-555555555555"
-      arn    = "arn:aws:kms:ap-northeast-1:123456789012:key/11111111-2222-3333-4444-555555555555"
-    }
+override_resource {
+  target          = aws_s3_bucket.storage
+  override_during = plan
+  values = {
+    bucket = "dev-vault-storage-20261018"
+    arn    = "arn:aws:s3:::dev-vault-storage-20261018"
+  }
+}
+
+override_resource {
+  target          = aws_kms_key.unseal
+  override_during = plan
+  values = {
+    key_id = "11111111-2222-3333-4444-555555555555"
+    arn    = "arn:aws:kms:ap-northeast-1:123456789012:key/11111111-2222-3333-4444-555555555555"
+  }
+}
+
+override_resource {
+  target          = module.instance.aws_instance.this
+  override_during = plan
+  values = {
+    private_ip = "10.10.10.25"
   }
 }
 
@@ -33,7 +50,7 @@ variables {
 }
 
 run "server" {
-  command = apply
+  command = plan
 
   assert {
     condition     = length(module.instance.instance_ids) == 1
@@ -46,7 +63,7 @@ run "server" {
   }
 
   assert {
-    condition     = output.vault_addr == "https://${module.instance.private_ips[0]}:8200"
+    condition     = output.vault_addr == "https://10.10.10.25:8200"
     error_message = "vault_addr should be https on the instance's private IP"
   }
 }

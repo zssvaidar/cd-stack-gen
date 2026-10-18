@@ -327,9 +327,26 @@ vault status          # UI: https://127.0.0.1:8200/ui
 The certificate is regenerated when the instance is replaced, so copy it again after that.
 
 ### Protecting the data
-- **The bucket:** `force_destroy = false`, so `destroy` fails while the bucket holds data. Empty
-  it yourself if you really mean to delete everything. Versioning keeps overwritten objects for
-  30 days.
+The bucket and the KMS key have `prevent_destroy`, so **`./run.sh <env> vault destroy` fails at
+plan time** with `Instance cannot be destroyed`, before anything is deleted. A full destroy
+followed by `apply` would otherwise reuse the old bucket with a brand-new KMS key, which can't
+unseal the existing data.
+
+Recreating just the server is safe; the data and the logins (userpass, tokens) stay in S3:
+
+```bash
+./run.sh dev vault apply   -replace='module.vault.module.instance.aws_instance.this[0]'
+./run.sh dev vault destroy -target='module.vault.module.instance'   # remove the server only
+```
+
+The new instance gets a new IP and a new self-signed certificate, so restart the tunnel and copy
+`vault.crt` again.
+
+To wipe a Vault for good: remove both `prevent_destroy` blocks in `modules/vault/main.tf`, empty
+the (versioned) bucket, then destroy.
+
+- **The bucket:** also `force_destroy = false`, so even without `prevent_destroy` it can't be
+  deleted while it holds data. Versioning keeps overwritten objects for 30 days.
 - **The KMS key:** destroying it schedules deletion with a 30-day window. Once it's actually
   deleted, the data in S3 can never be unsealed again. `aws kms cancel-key-deletion` undoes a
   mistake within the window.
@@ -380,6 +397,7 @@ All offline against a mock AWS provider, no credentials:
   settings (EIP per instance, source/dest check off, VPC-wide inbound rule, no role).
 - **nat:** one shared instance routes both AZs; one per AZ routes each AZ to its own; more
   instances than AZs is rejected.
-- **vault:** exactly one instance; user-data passes the real bucket, key and region; the
+- **vault:** (plan-only, since prevent_destroy blocks the test teardown) exactly one instance;
+  user-data passes the real bucket, key and region; the
   storage bucket can't be force-destroyed and blocks public access; the KMS key rotates and has
   a 30-day deletion window.

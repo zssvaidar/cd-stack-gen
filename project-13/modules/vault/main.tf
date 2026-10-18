@@ -21,6 +21,13 @@ resource "aws_s3_bucket" "storage" {
   force_destroy = false
 
   tags = var.tags
+
+  # a plain `destroy` of the layer stops at plan time instead of deleting the vault. Recreate just
+  # the server with -replace / -target on module.instance (see README); remove this line (and
+  # the one on the KMS key) only to wipe the vault for good.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_s3_bucket_versioning" "storage" {
@@ -83,6 +90,11 @@ resource "aws_kms_key" "unseal" {
   deletion_window_in_days = var.kms_deletion_window_days
 
   tags = var.tags
+
+  # deleting this key makes the data in the bucket permanently unreadable - see the bucket above
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 resource "aws_kms_alias" "unseal" {
