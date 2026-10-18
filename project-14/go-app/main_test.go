@@ -20,6 +20,7 @@ func TestHealth(t *testing.T) {
 		{"/health", false, http.StatusOK},
 		{"/health/ready", false, http.StatusServiceUnavailable},
 		{"/health/ready", true, http.StatusOK},
+		{"/metrics", true, http.StatusOK},
 		{"/missing", true, http.StatusNotFound},
 	}
 	for _, c := range cases {

@@ -13,7 +13,20 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// Same name and unit as Spring Boot's Micrometer timer, so one dashboard query covers both.
+var requestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	Name: "http_server_requests_seconds",
+	Help: "HTTP request latency by method and status code.",
+}, []string{"method", "code"})
+
+func init() {
+	prometheus.MustRegister(requestDuration)
+}
 
 func main() {
 	healthcheck := flag.Bool("healthcheck", false, "probe the local /health endpoint and exit (for Docker HEALTHCHECK)")
@@ -34,7 +47,7 @@ func main() {
 	// HOST empty = all interfaces (containers); 127.0.0.1 behind a local reverse proxy.
 	srv := &http.Server{
 		Addr:              os.Getenv("HOST") + ":" + port,
-		Handler:           newMux(&ready),
+		Handler:           promhttp.InstrumentHandlerDuration(requestDuration, newMux(&ready)),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -81,6 +94,10 @@ func newMux(ready *atomic.Bool) *http.ServeMux {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 	})
+
+	// Prometheus metrics (Go runtime, process, requests). Behind nginx on the AMIs this path is
+	// blocked; Alloy scrapes it on loopback.
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return mux
 }

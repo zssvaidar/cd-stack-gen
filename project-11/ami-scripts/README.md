@@ -116,6 +116,28 @@ first boot. It migrates and rebuilds Laravel's caches. User-data can write `DB_*
 `RUN_MIGRATIONS=true` there first to use RDS instead of the instance-local SQLite file. Point a
 target group at `/health/ready` (Spring: `/actuator/health/readiness`).
 
+All four app images also install **Grafana Alloy**. The installer, `project-14/monitoring/alloy/install.sh`,
+comes from the same checkout and uses one shared `config.alloy`. Alloy ships host metrics, the app's
+Prometheus metrics, a blackbox probe of the health URL, and the journal of the app's units (including
+nginx's access log, which also goes to syslog). It sends them to the monitoring host built by
+`grafana.sh`, labelled `app`/`env`/`host`. It ships switched off: `alloy.service` only starts once
+`/etc/alloy/endpoint.env` exists. Write that file from user-data (`MONITORING_HOST=<ip>`,
+optionally `ENVIRONMENT=dev`), or run `sudo alloy-endpoint <ip> dev` on a running instance. The app's
+metrics endpoint is scraped on loopback and returns 404 through nginx.
+
+`grafana.sh` is that monitoring host: Grafana on `:3000`, **Mimir** on `:9009` (Prometheus-compatible
+metrics store, receives Alloy's remote-write) and **Loki** on `:3100` (logs), all from Grafana's
+signed rpm repo, plus Alloy for its own metrics. Its configs are files in the repo too
+(`project-14/monitoring/`), fetched the same way. Grafana comes with both data sources and a
+"project-14 apps" dashboard provisioned (health, traffic, 5xx, p95 latency, php-fpm, CPU/memory/disk,
+logs). Nothing secret is baked in. The packages start their services with default configs on install,
+so the script stops them and deletes what they wrote, including a Grafana database with the default
+admin/admin login. On first boot `grafana-init` generates the admin password into
+`/etc/grafana/admin.env`, unless user-data wrote one there first. The smoke test checks that metrics
+and logs flow through Alloy into Mimir and Loki, and that admin/admin is refused. Then it wipes all of
+that state. Build it once and launch one per environment (`INSTANCE_TYPE=t3.medium`). Mimir and Loki
+have no authentication here, so allow 9009/3100 from the VPC only.
+
 **Runs as root.** Packer connects over SSH as `ec2-user`, not root, but `packer/ami.pkr.hcl`'s
 provisioner block wraps the script in `sudo` (`execute_command`) — the same effective privilege
 the old user-data/cloud-init approach had, just made explicit instead of implicit. Write scripts

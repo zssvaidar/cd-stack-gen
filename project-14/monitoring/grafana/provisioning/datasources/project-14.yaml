@@ -1,0 +1,21 @@
+# Provisioned by ami-scripts/grafana.sh - Mimir and Loki on this same host.
+apiVersion: 1
+
+datasources:
+  - name: Mimir
+    uid: mimir
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9009/prometheus
+    isDefault: true
+    editable: false
+    jsonData:
+      prometheusType: Mimir
+      timeInterval: 15s
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://127.0.0.1:3100
+    editable: false

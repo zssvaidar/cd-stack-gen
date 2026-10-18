@@ -1,0 +1,120 @@
+// Grafana Alloy on every project-14 instance (the four app images and the monitoring host
+// itself). Collects, labelled app/env/host (a target's own "instance" label always wins, hence "host"):
+//   - host metrics (CPU, memory, disk, network)          -> Mimir
+//   - the app's own metrics endpoint                     -> Mimir
+//   - a blackbox probe of the app's health URL           -> Mimir (probe_success)
+//   - the systemd journal of the app's units             -> Loki
+//
+// Everything instance-specific comes from the environment (see install.sh):
+//   /etc/alloy/app.env       baked by the AMI script: APP_NAME, APP_METRICS_ADDR,
+//                            APP_METRICS_PATH, APP_HEALTH_URL, LOG_UNITS
+//   /etc/alloy/endpoint.env  written at launch (user-data or alloy-endpoint): MONITORING_HOST,
+//                            ENVIRONMENT. Alloy stays stopped until this file exists.
+
+// ---------------------------------------------------------------------------
+// Where everything goes: the monitoring host (ami-scripts/grafana.sh)
+// ---------------------------------------------------------------------------
+
+prometheus.remote_write "monitoring" {
+	endpoint {
+		url = "http://" + sys.env("MONITORING_HOST") + ":9009/api/v1/push"
+	}
+
+	external_labels = {
+		app  = sys.env("APP_NAME"),
+		env  = coalesce(sys.env("ENVIRONMENT"), "unknown"),
+		host = constants.hostname,
+	}
+}
+
+loki.write "monitoring" {
+	endpoint {
+		url = "http://" + sys.env("MONITORING_HOST") + ":3100/loki/api/v1/push"
+	}
+
+	external_labels = {
+		app  = sys.env("APP_NAME"),
+		env  = coalesce(sys.env("ENVIRONMENT"), "unknown"),
+		host = constants.hostname,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Host metrics (node_exporter built in)
+// ---------------------------------------------------------------------------
+
+prometheus.exporter.unix "host" { }
+
+prometheus.scrape "host" {
+	job_name        = "node"
+	targets         = prometheus.exporter.unix.host.targets
+	scrape_interval = "30s"
+	forward_to      = [prometheus.remote_write.monitoring.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// The app's own metrics, scraped on loopback - never through nginx, which hides them
+// ---------------------------------------------------------------------------
+
+prometheus.scrape "app" {
+	job_name = "app"
+	targets  = [{
+		"__address__"      = sys.env("APP_METRICS_ADDR"),
+		"__metrics_path__" = sys.env("APP_METRICS_PATH"),
+	}]
+	scrape_interval = "15s"
+	forward_to      = [prometheus.remote_write.monitoring.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// Health: probe the same URL a load balancer would, through nginx
+// ---------------------------------------------------------------------------
+
+prometheus.exporter.blackbox "health" {
+	config = "{ modules: { http_2xx: { prober: http, timeout: 5s } } }"
+
+	target {
+		name    = "health"
+		address = sys.env("APP_HEALTH_URL")
+		module  = "http_2xx"
+	}
+}
+
+prometheus.scrape "health" {
+	job_name        = "health"
+	targets         = prometheus.exporter.blackbox.health.targets
+	scrape_interval = "15s"
+	forward_to      = [prometheus.remote_write.monitoring.receiver]
+}
+
+// ---------------------------------------------------------------------------
+// Logs: the journal, kept to the app's units (LOG_UNITS is a regex, e.g.
+// "go-app.service|nginx.service"). The alloy user is in systemd-journal (rpm postinstall).
+// ---------------------------------------------------------------------------
+
+loki.relabel "journal" {
+	forward_to = []
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		regex         = sys.env("LOG_UNITS")
+		action        = "keep"
+	}
+
+	rule {
+		source_labels = ["__journal__systemd_unit"]
+		target_label  = "unit"
+	}
+
+	rule {
+		source_labels = ["__journal_priority_keyword"]
+		target_label  = "level"
+	}
+}
+
+loki.source.journal "units" {
+	max_age       = "12h"
+	relabel_rules = loki.relabel.journal.rules
+	labels        = {job = "journal"}
+	forward_to    = [loki.write.monitoring.receiver]
+}

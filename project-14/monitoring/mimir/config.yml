@@ -1,0 +1,89 @@
+# Grafana Mimir, single binary ("monolithic"), local filesystem storage. Receives Prometheus
+# remote-write from every instance's Alloy and answers Grafana's PromQL queries.
+#   push:  http://<host>:9009/api/v1/push
+#   query: http://<host>:9009/prometheus
+# One node, so every ring is in-memory and replication is 1. Data lives in /var/lib/mimir.
+
+multitenancy_enabled: false
+target: all
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+  log_level: warn
+
+# Rings not set to inmemory below still start memberlist - keep it on loopback, there's one node.
+memberlist:
+  bind_addr: [127.0.0.1]
+  advertise_addr: 127.0.0.1
+
+common:
+  storage:
+    backend: filesystem
+    filesystem:
+      dir: /var/lib/mimir/data
+
+blocks_storage:
+  storage_prefix: blocks
+  tsdb:
+    dir: /var/lib/mimir/tsdb
+  bucket_store:
+    sync_dir: /var/lib/mimir/tsdb-sync
+
+compactor:
+  data_dir: /var/lib/mimir/compactor
+  sharding_ring:
+    kvstore:
+      store: inmemory
+
+distributor:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+ingester:
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+    replication_factor: 1
+
+store_gateway:
+  sharding_ring:
+    replication_factor: 1
+    kvstore:
+      store: inmemory
+
+# The querier connects back to the query-frontend at its advertised address - loopback too.
+frontend:
+  address: 127.0.0.1
+
+ruler:
+  ring:
+    kvstore:
+      store: inmemory
+
+ruler_storage:
+  backend: filesystem
+  filesystem:
+    dir: /var/lib/mimir/rules
+
+alertmanager_storage:
+  backend: filesystem
+  filesystem:
+    dir: /var/lib/mimir/alertmanager
+
+limits:
+  # how long blocks are kept
+  compactor_blocks_retention_period: 30d
+  # a handful of instances per environment - generous, not tuned
+  ingestion_rate: 50000
+  max_global_series_per_user: 500000
+
+usage_stats:
+  enabled: false
+
+# defaults to ./metrics-activity.log in the working directory
+activity_tracker:
+  filepath: /var/lib/mimir/metrics-activity.log

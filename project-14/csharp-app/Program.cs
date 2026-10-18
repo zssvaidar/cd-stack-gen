@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
+using Prometheus;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -26,6 +27,9 @@ var app = builder.Build();
 
 app.UseForwardedHeaders();
 
+// Request count/duration per route (http_request_duration_seconds), plus .NET runtime metrics.
+app.UseHttpMetrics();
+
 app.MapGet("/", () => new { app = "csharp-app", message = "Hello from ASP.NET Core" });
 
 // Liveness: process is up, runs no checks.
@@ -41,6 +45,9 @@ app.MapHealthChecks("/health/ready", new HealthCheckOptions
     Predicate = check => check.Tags.Contains("ready"),
     ResponseWriter = WriteJson,
 });
+
+// Prometheus metrics. Behind nginx on the AMIs this path is blocked; Alloy scrapes it on loopback.
+app.MapMetrics("/metrics");
 
 app.Run();
 

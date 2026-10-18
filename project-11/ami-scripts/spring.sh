@@ -30,6 +30,8 @@ APP_REF="${APP_REF:-master}"
 # SSM SecureString holding a read-only token for APP_SOURCE. The builder's instance profile
 # needs ssm:GetParameter on it. Never baked into the image.
 APP_GIT_TOKEN_PARAM="${APP_GIT_TOKEN_PARAM:-}"
+# Shared Grafana Alloy setup inside APP_SOURCE (see "Monitoring" below).
+MONITORING_SUBDIR="${MONITORING_SUBDIR:-project-14/monitoring}"
 # The app's directory inside APP_SOURCE.
 APP_SUBDIR="${APP_SUBDIR:-project-14/spring-app}"
 
@@ -145,7 +147,9 @@ systemctl enable $APP_NAME.service
 
 
 # --------------------------------------------------
-# nginx: :80 -> 127.0.0.1:8080. Health probes kept out of the access log.
+# nginx: :80 -> 127.0.0.1:8080. Access log to the journal too (for Loki), health probes kept
+# out of both. Actuator is closed apart from health - /actuator/prometheus is for Alloy on
+# loopback only.
 # --------------------------------------------------
 
 cat > /etc/nginx/conf.d/app.conf <<EOF
@@ -153,9 +157,16 @@ server {
     listen 80 default_server;
     server_name _;
 
-    location /health {
+    access_log /var/log/nginx/access.log combined;
+    access_log syslog:server=unix:/dev/log,tag=nginx,nohostname combined;
+
+    location /actuator/health {
         access_log off;
         proxy_pass http://127.0.0.1:$APP_PORT;
+    }
+
+    location /actuator/ {
+        return 404;
     }
 
     location / {
@@ -170,6 +181,19 @@ EOF
 
 nginx -t
 systemctl enable nginx.service
+
+
+# --------------------------------------------------
+# Monitoring: Grafana Alloy ships host metrics, the app's metrics, a health probe and the journal
+# of these units to the monitoring host (grafana.sh). Off until /etc/alloy/endpoint.env exists -
+# see project-14/monitoring/alloy/install.sh.
+# --------------------------------------------------
+
+export APP_NAME
+APP_METRICS_ADDR=127.0.0.1:$APP_PORT APP_METRICS_PATH=/actuator/prometheus \
+APP_HEALTH_URL=http://127.0.0.1/actuator/health/readiness \
+LOG_UNITS="$APP_NAME.service|nginx.service" \
+    bash "$SRC/$MONITORING_SUBDIR/alloy/install.sh"
 
 
 # --------------------------------------------------
@@ -192,6 +216,11 @@ for _ in $(seq 60); do
     curl -fsS http://127.0.0.1/actuator/health/readiness 2>/dev/null | grep -q '"status":"UP"' && break
     sleep 1
 done
+
+curl -fsS http://127.0.0.1:$APP_PORT/actuator/prometheus | grep -q '^# HELP' \
+    || { echo "spring.sh: smoke test failed - no Prometheus metrics on 127.0.0.1:$APP_PORT/actuator/prometheus" >&2; exit 1; }
+[[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/actuator/prometheus)" == 404 ]] \
+    || { echo "spring.sh: smoke test failed - /actuator/prometheus is reachable through nginx" >&2; exit 1; }
 
 curl -fsS http://127.0.0.1/actuator/health/readiness | grep -q '"status":"UP"' \
     && echo "spring.sh: smoke test passed - app reachable through nginx" \

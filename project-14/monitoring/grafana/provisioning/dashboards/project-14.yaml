@@ -1,0 +1,11 @@
+# Dashboards from /etc/grafana/dashboards (project-14/monitoring/grafana/dashboards), read-only
+# in the UI - change the JSON in the repo and rebake.
+apiVersion: 1
+
+providers:
+  - name: project-14
+    folder: project-14
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

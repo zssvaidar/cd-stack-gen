@@ -45,6 +45,8 @@ APP_REF="${APP_REF:-master}"
 APP_GIT_TOKEN_PARAM="${APP_GIT_TOKEN_PARAM:-}"
 # The app's directory inside APP_SOURCE.
 APP_SUBDIR="${APP_SUBDIR:-project-14/laravel-app}"
+# Shared Grafana Alloy setup inside APP_SOURCE (see "Monitoring" below).
+MONITORING_SUBDIR="${MONITORING_SUBDIR:-project-14/monitoring}"
 # First PHP line Amazon Linux has packages for wins. Laravel 13 needs 8.3+.
 PHP_VERSIONS="${PHP_VERSIONS:-8.4 8.3}"
 
@@ -207,6 +209,8 @@ set_default APP_ENV production
 set_default APP_DEBUG false
 set_default APP_KEY "base64:$(head -c 32 /dev/urandom | base64)"
 set_default DB_CONNECTION sqlite
+# PHP's error log -> php-fpm's log -> syslog -> the journal, which Alloy ships to Loki
+set_default LOG_CHANNEL errorlog
 
 migrate=$(get RUN_MIGRATIONS)
 if [[ "$(get DB_CONNECTION)" == "sqlite" ]]; then
@@ -253,10 +257,13 @@ EOF
 
 # --------------------------------------------------
 # php-fpm: one pool for the app, as $APP_USER, on a socket only nginx can reach. The distro's
-# "www" pool (as apache) is dropped.
+# "www" pool (as apache) is dropped. Logs go to syslog (the journal). The pool's status page
+# feeds Alloy's metrics scrape (OpenMetrics, see nginx below).
 # --------------------------------------------------
 
 rm -f /etc/php-fpm.d/www.conf
+sed -i 's|^;*error_log = .*|error_log = syslog|' /etc/php-fpm.conf
+grep -q '^error_log = syslog' /etc/php-fpm.conf || echo 'error_log = syslog' >> /etc/php-fpm.conf
 cat > /etc/php-fpm.d/$APP_NAME.conf <<EOF
 [$APP_NAME]
 user = $APP_USER
@@ -272,9 +279,10 @@ pm.start_servers = 2
 pm.min_spare_servers = 1
 pm.max_spare_servers = 4
 pm.max_requests = 500
+pm.status_path = /fpm-status
 
 catch_workers_output = yes
-php_admin_value[error_log] = /var/log/php-fpm/$APP_NAME-error.log
+decorate_workers_output = no
 EOF
 
 systemctl daemon-reload
@@ -282,7 +290,10 @@ systemctl enable $APP_NAME-init.service php-fpm.service
 
 
 # --------------------------------------------------
-# nginx: :80 -> php-fpm, Laravel-style front controller. Health probes kept out of the access log.
+# nginx: :80 -> php-fpm, Laravel-style front controller. Access log to the journal too (for
+# Loki), health probes kept out of both. 127.0.0.1:9180/metrics serves php-fpm's status page
+# as OpenMetrics, for Alloy only - /fpm-status isn't reachable through :80 (it falls through to
+# Laravel's 404).
 # --------------------------------------------------
 
 cat > /etc/nginx/conf.d/app.conf <<EOF
@@ -299,6 +310,7 @@ server {
     client_max_body_size 20m;
 
     access_log /var/log/nginx/access.log combined if=\$app_loggable;
+    access_log syslog:server=unix:/dev/log,tag=nginx,nohostname combined if=\$app_loggable;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
@@ -316,10 +328,37 @@ server {
         deny all;
     }
 }
+
+server {
+    listen 127.0.0.1:9180;
+    access_log off;
+
+    location = /metrics {
+        fastcgi_pass unix:$FPM_SOCK;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_NAME /fpm-status;
+        fastcgi_param SCRIPT_FILENAME /fpm-status;
+        fastcgi_param REQUEST_URI /fpm-status;
+        fastcgi_param QUERY_STRING openmetrics;
+    }
+}
 EOF
 
 nginx -t
 systemctl enable nginx.service
+
+
+# --------------------------------------------------
+# Monitoring: Grafana Alloy ships host metrics, php-fpm metrics, a health probe and the journal
+# of these units to the monitoring host (grafana.sh). Off until /etc/alloy/endpoint.env exists -
+# see project-14/monitoring/alloy/install.sh.
+# --------------------------------------------------
+
+export APP_NAME
+APP_METRICS_ADDR=127.0.0.1:9180 APP_METRICS_PATH=/metrics \
+APP_HEALTH_URL=http://127.0.0.1/health/ready \
+LOG_UNITS="php-fpm.service|nginx.service|$APP_NAME-init.service" \
+    bash "$SRC/$MONITORING_SUBDIR/alloy/install.sh"
 
 
 # --------------------------------------------------
@@ -343,6 +382,8 @@ systemctl restart nginx.service || ok=false
 curl -fsS http://127.0.0.1/health/ready | grep -q '"database":"UP"' || ok=false
 curl -fsS -o /dev/null http://127.0.0.1/up || ok=false
 curl -fsS -o /dev/null http://127.0.0.1/ || ok=false
+curl -fsS http://127.0.0.1:9180/metrics | grep -q '^phpfpm_up 1' || ok=false
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/fpm-status | grep -q 404 || ok=false
 
 systemctl stop nginx.service php-fpm.service || true
 systemctl stop $APP_NAME-init.service || true
