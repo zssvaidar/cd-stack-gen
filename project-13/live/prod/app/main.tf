@@ -57,6 +57,13 @@ data "terraform_remote_state" "ami" {
     key    = "shared/ami-nodejs.tfstate"
     region = var.region
   }
+
+  # the image layer may already be gone when this one is destroyed - without a default, even
+  # `destroy` fails with "Unsupported attribute". On apply a null AMI just fails at the
+  # instance, so build the shared/ami-* layer first.
+  defaults = {
+    ami_id = null
+  }
 }
 
 locals {
