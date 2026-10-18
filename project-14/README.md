@@ -53,6 +53,25 @@ For Graviton (arm64) tasks build with `docker buildx build --platform linux/arm6
   (or run `php artisan migrate --force` as a one-off task).
 - Config, routes and views are cached at container start, after the task's env is applied.
 
+## Plain EC2 instead of containers: AMIs
+
+Each app also has a Packer provisioner script in
+[`project-11/ami-scripts/`](../project-11/ami-scripts/) (project-13 reads the same folder through its
+`ami-scripts` symlink). The script builds the app on the builder instance and runs it under systemd
+behind nginx on `:80`. It smoke-tests the app before the snapshot.
+
+| App | Script | Bake |
+|---|---|---|
+| laravel-app | `laravel.sh` | `run.sh ami laravel-app laravel create` |
+| spring-app | `spring.sh` | `run.sh ami spring-app spring create` |
+| csharp-app | `csharp.sh` | `run.sh ami csharp-app csharp create` |
+| go-app | `go.sh` | `run.sh ami go-app go create` |
+
+By default they fetch this repo from GitHub at `master`. Override that with
+`PROVISION_ENV="APP_REF=<branch>"`, or give an `APP_SOURCE=s3://...` tarball or an
+`APP_GIT_TOKEN_PARAM` for a private repo. See the ami-scripts README for the details, including how
+the Laravel image generates its `APP_KEY` on first boot.
+
 ## Tests
 
 ```sh

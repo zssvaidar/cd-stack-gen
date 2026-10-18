@@ -99,6 +99,23 @@ APIs over HTTPS - then deletes every container, volume, certificate and secret i
 each instance starts empty and generates its own. See the top-level README for the full
 bake/launch/DNS walk-through.
 
+`laravel.sh`, `spring.sh`, `csharp.sh` and `go.sh` bake [project-14](../../project-14/)'s four
+apps onto plain EC2 instances, one image each (`run.sh ami <name> laravel|spring|csharp|go create`).
+They share `nodejs.sh`'s shape: nginx on `:80` in front, the app as a systemd service on
+`127.0.0.1:8080` (Laravel: php-fpm on a unix socket), and a build-time smoke test of the app's
+readiness endpoint through nginx. They also share `docker.sh`'s source handling: the app is
+fetched from `APP_SOURCE`, which defaults to this repo's git URL at `APP_REF=master`. That can be
+an `s3://` tarball instead, or a private git repo with `APP_GIT_TOKEN_PARAM`. `APP_SUBDIR` picks
+the app's folder. The app is built on the builder, and the build toolchain is removed again before
+the snapshot: Go keeps only its static binary, Spring keeps the jar plus the headless Corretto 21
+JRE, and C# keeps a self-contained publish with no .NET install on the box. Laravel keeps PHP and
+php-fpm, but its Composer dependencies are installed without dev packages and Composer itself is
+removed. `laravel.sh` bakes no secrets. `laravel-app-init.service` runs before php-fpm at
+every boot and writes `/etc/laravel-app/app.env`, the app's `.env`, with a fresh `APP_KEY` on
+first boot. It migrates and rebuilds Laravel's caches. User-data can write `DB_*` and
+`RUN_MIGRATIONS=true` there first to use RDS instead of the instance-local SQLite file. Point a
+target group at `/health/ready` (Spring: `/actuator/health/readiness`).
+
 **Runs as root.** Packer connects over SSH as `ec2-user`, not root, but `packer/ami.pkr.hcl`'s
 provisioner block wraps the script in `sudo` (`execute_command`) — the same effective privilege
 the old user-data/cloud-init approach had, just made explicit instead of implicit. Write scripts

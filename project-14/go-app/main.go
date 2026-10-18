@@ -31,8 +31,9 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	var ready atomic.Bool
+	// HOST empty = all interfaces (containers); 127.0.0.1 behind a local reverse proxy.
 	srv := &http.Server{
-		Addr:              ":" + port,
+		Addr:              os.Getenv("HOST") + ":" + port,
 		Handler:           newMux(&ready),
 		ReadHeaderTimeout: 5 * time.Second,
 	}

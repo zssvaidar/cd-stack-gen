@@ -5,9 +5,10 @@ using Microsoft.Extensions.Diagnostics.HealthChecks;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Same convention as the other apps: listen on $PORT (default 8080).
+// Same convention as the other apps: listen on $HOST:$PORT (default 0.0.0.0:8080).
+var host = Environment.GetEnvironmentVariable("HOST") ?? "0.0.0.0";
 var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
-builder.WebHost.UseUrls($"http://0.0.0.0:{port}");
+builder.WebHost.UseUrls($"http://{host}:{port}");
 
 // Tag checks "ready" to have /health/ready include them (e.g. AddNpgSql, AddDbContextCheck).
 builder.Services.AddHealthChecks()
