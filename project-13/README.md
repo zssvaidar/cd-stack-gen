@@ -9,8 +9,9 @@ Built step by step:
 
 1. The state bucket and the dev/prod VPCs.
 2. Modules for baking an AMI from `ami-scripts/*.sh` and launching instances from it.
-3. **(this)** Images in `shared/ami-*` (egress-gateway, nodejs), NAT instances per env, and the
+3. Images in `shared/ami-*` (egress-gateway, nodejs), NAT instances per env, and the
    Node.js app on plain EC2 instances per env.
+4. **(this)** Vault per env: a Docker image running Vault, S3 storage, KMS auto-unseal.
 
 Next: a load balancer in front of the app, then the ECS/RDS/bun-hydrate layers.
 
@@ -26,16 +27,20 @@ project-13/
       packer/ami.pkr.hcl
     instance/                 launch N instances from an AMI
     nat/                      NAT instances + the app tier's default routes (uses instance/)
+    vault/                    Vault server: S3 storage bucket, KMS unseal key, instance (uses instance/)
     */tests/*.tftest.hcl      offline tests (mock provider, no AWS creds)
   live/                       one folder per deployment, each its own state <env>/<layer>.tfstate
     shared/ami-egress-gateway/  NAT image, used by every env's nat layer
     shared/ami-nodejs/        Node.js app image, used by every env's app layer
+    shared/ami-docker-vault/  Docker + Vault image, used by every env's vault layer
     dev/network/              dev VPC   - 10.10.0.0/16
     dev/nat/                  1 NAT instance, shared by both AZs
     dev/app/                  1 Node.js instance
+    dev/vault/                Vault (1 instance) + its S3 bucket and KMS key
     prod/network/             prod VPC  - 10.20.0.0/16
     prod/nat/                 2 NAT instances, one per AZ
     prod/app/                 2 Node.js instances, one per AZ
+    prod/vault/               Vault (1 instance) + its S3 bucket and KMS key
 ```
 
 Layers depend on each other only through state outputs (`terraform_remote_state`), so apply
@@ -257,6 +262,80 @@ To deploy a new app version, change `ami-scripts/nodejs_caddy.sh` (or point it a
 then run `./run.sh shared ami-nodejs apply` followed by `./run.sh <env> app apply`. The
 instances are replaced from the new image: dev first, then prod, with the same image.
 
+## Vault (`modules/vault`, `live/<env>/vault`)
+
+HashiCorp Vault in a Docker container on one EC2 instance, with its data in S3:
+
+```
+dev/vault
+  ├─ S3 bucket   dev-vault-storage-…   Vault's storage backend (versioned, encrypted, private)
+  ├─ KMS key     alias/dev-vault-unseal auto-unseal - no unseal keys to enter after a restart
+  ├─ IAM         instance role: that bucket + that key only (plus SSM)
+  └─ instance    docker-vault image, private app subnet, :8200 from inside the VPC only
+```
+
+**The image** (`ami-scripts/docker_vault.sh`, layer `shared/ami-docker-vault`) contains:
+- Docker, and the `hashicorp/vault:2.1.2` image pinned by digest and pulled at build time, so
+  instances never need Docker Hub.
+- `vault.service`, which runs the container with host networking and `IPC_LOCK`.
+- A renderer that runs before every start. It writes `vault.hcl` from `/etc/vault/vault.env`,
+  which user-data fills with the bucket, key ID and region. On first boot it also generates a
+  self-signed TLS certificate for the instance's private IP, so no private key is ever baked
+  into the image.
+- A `vault` command on the host that runs the CLI inside the container, already pointed at the
+  server.
+
+**Single instance by design.** Vault's S3 backend doesn't support HA. Everything lives in the
+bucket, so the instance is disposable: replacing it (new image, `user_data` change, another AZ)
+brings back the same Vault, unsealed by KMS.
+
+### Run it
+```bash
+./run.sh shared ami-docker-vault apply   # ~5-10 min
+./run.sh dev nat apply                   # first - KMS is reached through the NAT
+./run.sh dev vault apply
+./run.sh dev vault output                # vault_addr, instance_id, storage_bucket, kms_alias
+```
+
+### Initialize once
+A new Vault starts uninitialized. On the instance, through SSM:
+```bash
+aws ssm start-session --target "$(./run.sh dev vault output -raw instance_id)"
+sudo vault status                         # Initialized: false, Seal Type: awskms
+sudo vault operator init                  # prints 5 recovery keys + the initial root token
+```
+**Store the recovery keys and root token somewhere safe, outside AWS** (a password manager).
+With KMS auto-unseal the recovery keys don't unseal anything, but they're needed for some
+operations, such as generating a new root token. Vault never shows them again. After that:
+```bash
+sudo VAULT_TOKEN=<root token> vault secrets enable -path=secret kv-v2
+sudo VAULT_TOKEN=<root token> vault kv put secret/hello value=world
+```
+Restarts and instance replacements unseal on their own from then on (`vault status` shows
+`Sealed: false`).
+
+### Reaching it
+`vault_addr` (`https://<private-ip>:8200`) only works from inside the VPC. From your machine,
+use an SSM port forward, then trust the instance's self-signed certificate:
+```bash
+aws ssm start-session --target <instance_id> --document-name AWS-StartPortForwardingSession \
+    --parameters portNumber=8200,localPortNumber=8200
+# copy the CA once: on the instance, sudo cat /etc/vault/tls/vault.crt
+export VAULT_ADDR=https://127.0.0.1:8200 VAULT_CACERT=./vault.crt
+vault status          # UI: https://127.0.0.1:8200/ui
+```
+The certificate is regenerated when the instance is replaced, so copy it again after that.
+
+### Protecting the data
+- **The bucket:** `force_destroy = false`, so `destroy` fails while the bucket holds data. Empty
+  it yourself if you really mean to delete everything. Versioning keeps overwritten objects for
+  30 days.
+- **The KMS key:** destroying it schedules deletion with a 30-day window. Once it's actually
+  deleted, the data in S3 can never be unsealed again. `aws kms cancel-key-deletion` undoes a
+  mistake within the window.
+- **Backups:** the bucket is the backup unit. Copying its objects (or enabling S3 replication)
+  backs up Vault, but only together with the KMS key.
+
 ## Cost
 
 Rough on-demand prices in ap-northeast-1:
@@ -266,9 +345,11 @@ Rough on-demand prices in ap-northeast-1:
 | Network | free | - | - |
 | NAT instance (t3.micro) + Elastic IP | ≈ $10 + $3.60/month | 1 | 2 |
 | App instance (t3.micro) | ≈ $10/month | 1 | 2 |
-| AMI snapshot (8 GiB) | ≈ $0.40/month | 2 images, shared | |
+| AMI snapshot (8 GiB) | ≈ $0.40/month | 3 images, shared | |
+| Vault: t3.small + KMS key + S3 | ≈ $20 + $1 + cents/month | 1 | 1 |
 
-That comes to about $24/month for dev, $47/month for prod, and under $1 for the images,
+That comes to about $45/month for dev, $68/month for prod (Vault included), and about $1.20
+for the images,
 plus EBS root volumes at about $0.80 per instance. NAT instances also have no per-GB
 processing fee, which a NAT Gateway would charge. `./run.sh <env> app destroy` and
 `./run.sh <env> nat destroy` stop the charges and leave the network in place.
@@ -284,7 +365,7 @@ Losing that file is harmless - the bucket just isn't Terraform-managed until you
 ## Tests
 
 ```bash
-for m in vpc ami instance nat; do (cd modules/$m && terraform init && terraform test); done
+for m in vpc ami instance nat vault; do (cd modules/$m && terraform init && terraform test); done
 ```
 
 All offline against a mock AWS provider, no credentials:
@@ -299,3 +380,6 @@ All offline against a mock AWS provider, no credentials:
   settings (EIP per instance, source/dest check off, VPC-wide inbound rule, no role).
 - **nat:** one shared instance routes both AZs; one per AZ routes each AZ to its own; more
   instances than AZs is rejected.
+- **vault:** exactly one instance; user-data passes the real bucket, key and region; the
+  storage bucket can't be force-destroyed and blocks public access; the KMS key rotates and has
+  a 30-day deletion window.

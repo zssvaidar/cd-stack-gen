@@ -75,7 +75,7 @@ variable "ssm_access" {
 }
 
 variable "iam_policy_arns" {
-  description = "Extra managed policies for the instance role (only used when ssm_access = true, which creates the role)."
+  description = "Extra managed policies for the instance role (only used when ssm_access = true, which creates the role). ARNs must be known at plan time (e.g. AWS-managed); for a policy created in the same apply, attach it to iam_role_name instead (see modules/vault)."
   type        = list(string)
   default     = []
 }
