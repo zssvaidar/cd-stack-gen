@@ -1,5 +1,5 @@
-# Node.js app image: nginx :80 -> node on 127.0.0.1:3000, smoke-tested at build time
-# (ami-scripts/nodejs.sh). Launched by live/<env>/app.
+# Node.js app image: Caddy :80 -> node on 127.0.0.1:3000, smoke-tested at build time
+# (ami-scripts/nodejs_caddy.sh - nodejs.sh is the same app behind nginx). Launched by live/<env>/app.
 #
 # One image per layer (live/shared/ami-<image>/), each with its own state, so each builds,
 # rebuilds and is destroyed on its own. Shared by every environment: built once, launched in
@@ -70,7 +70,7 @@ module "ami" {
   source = "../../../modules/ami"
 
   name             = "nodejs"
-  provision_script = "${local.ami_scripts}/nodejs.sh"
+  provision_script = "${local.ami_scripts}/nodejs_caddy.sh"
   subnet_id        = data.terraform_remote_state.dev_network.outputs.public_subnet_ids[0]
   region           = var.region
   tags             = merge(local.tags, { Role = "nodejs" })

@@ -64,7 +64,7 @@ locals {
   ami     = data.terraform_remote_state.ami.outputs
 }
 
-# The Node.js app (ami-scripts/nodejs.sh: nginx on :80 -> node on 127.0.0.1:3000), in prod's
+# The Node.js app (ami-scripts/nodejs_caddy.sh: Caddy on :80 -> node on 127.0.0.1:3000), in prod's
 # private app subnets - spread one per AZ. No public IP and only port 80 from inside the VPC;
 # reach it through a load balancer (later layer) or an SSM port forward (see README).
 # Needs prod/nat applied first: the SSM agent has to reach AWS's endpoints to register.

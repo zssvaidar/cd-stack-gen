@@ -38,6 +38,14 @@ systemd unit(s). The app itself is the same dependency-free app as
 replace the `cat > /opt/app/server.js` block with your own deploy step (copy build output in,
 fetch from S3/git, …) once you have a real one.
 
+`nodejs_caddy.sh` is the same app as `nodejs.sh` with **Caddy** in front instead of nginx
+(same ports: Caddy on `:80` → Node on `127.0.0.1:3000`, same `node-app.service`, same build-time
+smoke test). Caddy isn't in Amazon Linux's repos, so it's installed from the official release
+tarball, pinned and sha512-verified like `docker.sh`'s plugins, and runs as an unprivileged `caddy`
+user via the upstream systemd unit. The Caddyfile serves plain HTTP on `:80`; replace `:80` with
+a public hostname to get automatic Let's Encrypt TLS on the instance itself. project-13's
+`live/shared/ami-nodejs` builds this one.
+
 `bun.sh` is for a Bun app that has a build step producing static client assets alongside its
 server, the way [`bun-hydrate`](https://github.com/zssvaidar/bun-hydrate)'s `bun run build` emits
 `dist/public/*` next to `dist/index.js`. **There is no nginx on the instance.** Bun listens on

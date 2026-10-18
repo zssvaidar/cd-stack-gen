@@ -230,7 +230,7 @@ up first, then the route and the Elastic IP move to it, so the IP stays the same
 
 ## App (`live/<env>/app`)
 
-The Node.js image (`ami-scripts/nodejs.sh`: nginx on `:80` → Node on `127.0.0.1:3000`, with
+The Node.js image (`ami-scripts/nodejs_caddy.sh`: Caddy on `:80` → Node on `127.0.0.1:3000`, with
 `/health`), launched with `modules/instance` in the **private app subnets**, one per AZ (dev 1,
 prod 2). Each instance has no public IP. Its security group allows only port 80, and only from
 inside the VPC. Each also gets an SSM role.
@@ -253,7 +253,7 @@ curl localhost:8080/health      # {"status":"ok","service":"node-app"}
 This needs the [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 installed locally. `aws ssm start-session --target "$id"` alone gives a shell.
 
-To deploy a new app version, change `ami-scripts/nodejs.sh` (or point it at your real app),
+To deploy a new app version, change `ami-scripts/nodejs_caddy.sh` (or point it at your real app),
 then run `./run.sh shared ami-nodejs apply` followed by `./run.sh <env> app apply`. The
 instances are replaced from the new image: dev first, then prod, with the same image.
 
