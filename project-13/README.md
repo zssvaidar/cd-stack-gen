@@ -120,7 +120,9 @@ for a in laravel spring csharp go; do ./run.sh prod $a apply; done
 Tear down in reverse: `app`, `nat`, then `network`. `network` can't be destroyed while
 instances are still in its subnets. `./run.sh shared ami-<image> destroy` deregisters that image.
 Destroying an image first is fine: every layer that launches from one reads its `ami_id` with a
-`null` default, so `destroy` still works after the image's state is gone (only `apply` needs it).
+placeholder default (`ami-00000000000000000`), so `destroy` still works after the image's state
+is gone. `apply` with the placeholder stops at plan time ("No image for ...: apply that layer
+first").
 
 `run.sh <env> <layer> <action>` runs `terraform init` with the right backend config on first
 use, then the action in `live/<env>/<layer>`. Anything after the action is passed through

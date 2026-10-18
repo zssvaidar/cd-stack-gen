@@ -69,10 +69,10 @@ data "terraform_remote_state" "ami" {
   }
 
   # the image layer may already be gone when this one is destroyed - without a default, even
-  # `destroy` fails with "Unsupported attribute". On apply a null AMI just fails at the
-  # instance, so build the shared/ami-* layer first.
+  # `destroy` fails with "Unsupported attribute" (and a null ami fails the provider's own check).
+  # The placeholder lets destroy through; modules/instance's precondition stops an apply with it.
   defaults = {
-    ami_id = null
+    ami_id = "ami-00000000000000000"
   }
 }
 

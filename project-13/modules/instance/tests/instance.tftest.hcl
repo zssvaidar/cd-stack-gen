@@ -115,3 +115,14 @@ run "rejects_empty_subnets" {
 
   expect_failures = [var.subnet_ids]
 }
+
+run "rejects_placeholder_ami" {
+  command = plan
+
+  # the default live/* layers fall back to when their shared/ami-* state has no output
+  variables {
+    ami_id = "ami-00000000000000000"
+  }
+
+  expect_failures = [aws_instance.this]
+}

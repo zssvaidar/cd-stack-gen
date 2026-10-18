@@ -127,6 +127,14 @@ resource "aws_instance" "this" {
   # new AMI = new instance up before the old one goes, so e.g. a NAT route can move over
   lifecycle {
     create_before_destroy = true
+
+    # live/* layers read ami_id from a shared/ami-* state with this placeholder as the default,
+    # so `destroy` still works once the image layer is gone (the provider rejects a null ami even
+    # then). Preconditions are skipped on destroy, so this only stops an apply.
+    precondition {
+      condition     = var.ami_id != "ami-00000000000000000"
+      error_message = "No image for ${var.name}: its shared/ami-* layer has no ami_id output - apply that layer first."
+    }
   }
 }
 
