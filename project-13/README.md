@@ -9,7 +9,7 @@ Built step by step:
 
 1. The state bucket and the dev/prod VPCs.
 2. Modules for baking an AMI from `ami-scripts/*.sh` and launching instances from it.
-3. **(this)** Images in `shared/ami` (egress-gateway, nodejs), NAT instances per env, and the
+3. **(this)** Images in `shared/ami-*` (egress-gateway, nodejs), NAT instances per env, and the
    Node.js app on plain EC2 instances per env.
 
 Next: a load balancer in front of the app, then the ECS/RDS/bun-hydrate layers.
@@ -28,7 +28,8 @@ project-13/
     nat/                      NAT instances + the app tier's default routes (uses instance/)
     */tests/*.tftest.hcl      offline tests (mock provider, no AWS creds)
   live/                       one folder per deployment, each its own state <env>/<layer>.tfstate
-    shared/ami/               images used by every env: egress-gateway, nodejs
+    shared/ami-egress-gateway/  NAT image, used by every env's nat layer
+    shared/ami-nodejs/        Node.js app image, used by every env's app layer
     dev/network/              dev VPC   - 10.10.0.0/16
     dev/nat/                  1 NAT instance, shared by both AZs
     dev/app/                  1 Node.js instance
@@ -41,15 +42,15 @@ Layers depend on each other only through state outputs (`terraform_remote_state`
 them in order:
 
 ```
-network ──┬──────────────► nat ──► app
-          └─► shared/ami ──┘        ▲
-                    └───────────────┘
+dev network ─┬─► shared/ami-egress-gateway ─► <env> nat ─┐
+             └─► shared/ami-nodejs ──────────────────────┴─► <env> app
+<env> network ─► <env> nat ─► <env> app
 ```
 
 ## Prerequisites
 
 - Terraform >= 1.10 (S3-native state locking - no DynamoDB table).
-- [Packer](https://developer.hashicorp.com/packer/install) on PATH, for `shared ami` only
+- [Packer](https://developer.hashicorp.com/packer/install) on PATH, for the `shared ami-*` layers only
   (`modules/ami` runs it).
 - `wrapper/config/.env` filled in with the creator credentials, same as project-11/12
   (`cp wrapper/config/.env.example wrapper/config/.env` if you haven't already - it's the
@@ -68,8 +69,10 @@ network ──┬──────────────► nat ──► app
 ./run.sh prod network plan
 ./run.sh prod network apply
 
-./run.sh shared ami apply          # needs dev network - the builders run in its public subnet
-./run.sh shared ami output         # egress_gateway_ami_id, nodejs_ami_id
+# each image is its own layer - build, rebuild or destroy one without touching the other
+./run.sh shared ami-egress-gateway apply   # needs dev network - the builder runs in its public subnet
+./run.sh shared ami-nodejs apply
+./run.sh shared ami-nodejs output          # ami_id, ami_name
 
 ./run.sh dev nat apply             # NAT instance + app subnets' 0.0.0.0/0 routes
 ./run.sh dev app apply             # Node.js instance(s) - after nat, see below
@@ -79,7 +82,7 @@ network ──┬──────────────► nat ──► app
 ```
 
 Tear down in reverse: `app`, `nat`, then `network`. `network` can't be destroyed while
-instances are still in its subnets. `shared ami` destroy deregisters the images.
+instances are still in its subnets. `./run.sh shared ami-<image> destroy` deregisters that image.
 
 `run.sh <env> <layer> <action>` runs `terraform init` with the right backend config on first
 use, then the action in `live/<env>/<layer>`. Anything after the action is passed through
@@ -167,8 +170,14 @@ How it works (`modules/ami/main.tf`):
 - Debugging a failing script: run Packer by hand with `-on-error=ask` against
   `modules/ami/packer` (see `project-11/ami-scripts/README.md`).
 
-`live/shared/ami` uses it for the egress-gateway image. Images live in a `shared` layer, not
-per env: built once, the same image goes to dev and then prod.
+Each image has its own layer, `live/shared/ami-<image>/`, with one `module "ami"` block,
+its own state (`shared/ami-<image>.tfstate`) and outputs `ami_id`/`ami_name`. That way
+rebuilding one never plans or touches another. Images live in `shared`, not per env: built
+once, the same image goes to dev and then prod.
+
+To add an image, copy `live/shared/ami-nodejs/` to `live/shared/ami-<new>/`. Change
+`backend.key` to `shared/ami-<new>.tfstate`, and change `name` and `provision_script` in the
+module block. A layer that launches it reads `shared/ami-<new>.tfstate`'s `ami_id`.
 
 ## `modules/instance` - launch from an image
 
@@ -176,7 +185,7 @@ per env: built once, the same image goes to dev and then prod.
 module "nat" {
   source            = "../../../modules/instance"
   name              = "dev-nat"
-  ami_id            = <module.ami.ami_id, or from shared/ami's remote state>
+  ami_id            = <module.ami.ami_id, or ami_id from shared/ami-<image>'s remote state>
   vpc_id            = <network output>
   subnet_ids        = <network public_subnet_ids>   # round-robin: instance i -> subnet_ids[i % n]
   instance_count    = 1
@@ -245,7 +254,7 @@ This needs the [session-manager-plugin](https://docs.aws.amazon.com/systems-mana
 installed locally. `aws ssm start-session --target "$id"` alone gives a shell.
 
 To deploy a new app version, change `ami-scripts/nodejs.sh` (or point it at your real app),
-then run `./run.sh shared ami apply` followed by `./run.sh <env> app apply`. The
+then run `./run.sh shared ami-nodejs apply` followed by `./run.sh <env> app apply`. The
 instances are replaced from the new image: dev first, then prod, with the same image.
 
 ## Cost

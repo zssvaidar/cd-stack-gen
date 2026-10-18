@@ -54,7 +54,7 @@ data "terraform_remote_state" "ami" {
 
   config = {
     bucket = var.state_bucket
-    key    = "shared/ami.tfstate"
+    key    = "shared/ami-nodejs.tfstate"
     region = var.region
   }
 }
@@ -72,7 +72,7 @@ module "app" {
   source = "../../../modules/instance"
 
   name           = "prod-nodejs"
-  ami_id         = local.ami.nodejs_ami_id
+  ami_id         = local.ami.ami_id
   vpc_id         = local.network.vpc_id
   subnet_ids     = local.network.app_subnet_ids
   instance_count = 2

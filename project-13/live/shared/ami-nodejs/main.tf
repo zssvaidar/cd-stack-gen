@@ -1,6 +1,9 @@
-# Images shared by every environment - built once, launched in dev and prod alike, so prod runs
-# exactly the image that was tried in dev. One module block per image; each builds from one
-# ami-scripts/*.sh (symlinked from project-11).
+# Node.js app image: nginx :80 -> node on 127.0.0.1:3000, smoke-tested at build time
+# (ami-scripts/nodejs.sh). Launched by live/<env>/app.
+#
+# One image per layer (live/shared/ami-<image>/), each with its own state, so each builds,
+# rebuilds and is destroyed on its own. Shared by every environment: built once, launched in
+# dev and then prod, so prod runs exactly the image that was tried in dev.
 #
 # The temporary Packer builder runs in dev's first public subnet - it only needs a public,
 # IGW-routed subnet for the duration of the build.
@@ -16,7 +19,7 @@ terraform {
   }
 
   backend "s3" {
-    key          = "shared/ami.tfstate"
+    key          = "shared/ami-nodejs.tfstate"
     use_lockfile = true
     encrypt      = true
   }
@@ -63,19 +66,7 @@ locals {
   }
 }
 
-module "egress_gateway" {
-  source = "../../../modules/ami"
-
-  name             = "egress-gateway"
-  provision_script = "${local.ami_scripts}/egress-gateway.sh"
-  subnet_id        = data.terraform_remote_state.dev_network.outputs.public_subnet_ids[0]
-  region           = var.region
-  tags             = merge(local.tags, { Role = "egress-gateway" })
-}
-
-# nginx :80 -> Node.js app on 127.0.0.1:3000, smoke-tested at build time - see
-# ami-scripts/README.md (nodejs.sh)
-module "nodejs" {
+module "ami" {
   source = "../../../modules/ami"
 
   name             = "nodejs"
@@ -85,18 +76,10 @@ module "nodejs" {
   tags             = merge(local.tags, { Role = "nodejs" })
 }
 
-output "egress_gateway_ami_id" {
-  value = module.egress_gateway.ami_id
+output "ami_id" {
+  value = module.ami.ami_id
 }
 
-output "egress_gateway_ami_name" {
-  value = module.egress_gateway.ami_name
-}
-
-output "nodejs_ami_id" {
-  value = module.nodejs.ami_id
-}
-
-output "nodejs_ami_name" {
-  value = module.nodejs.ami_name
+output "ami_name" {
+  value = module.ami.ami_name
 }

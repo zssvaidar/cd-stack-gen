@@ -54,7 +54,7 @@ data "terraform_remote_state" "ami" {
 
   config = {
     bucket = var.state_bucket
-    key    = "shared/ami.tfstate"
+    key    = "shared/ami-egress-gateway.tfstate"
     region = var.region
   }
 }
@@ -69,7 +69,7 @@ module "nat" {
   source = "../../../modules/nat"
 
   name                = "prod-nat"
-  ami_id              = local.ami.egress_gateway_ami_id
+  ami_id              = local.ami.ami_id
   vpc_id              = local.network.vpc_id
   vpc_cidr            = local.network.vpc_cidr
   public_subnet_ids   = local.network.public_subnet_ids
