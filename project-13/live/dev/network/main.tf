@@ -40,8 +40,4 @@ module "vpc" {
   name     = "dev"
   cidr     = "10.10.0.0/16"
   az_count = 2
-
-  # one shared NAT Gateway - fine for dev, where an AZ outage taking out outbound internet
-  # for the whole env is an acceptable tradeoff for paying for one gateway instead of two
-  nat_mode = "single"
 }

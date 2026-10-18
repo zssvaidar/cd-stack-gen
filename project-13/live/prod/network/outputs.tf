@@ -24,6 +24,14 @@ output "db_subnet_ids" {
   value = module.vpc.db_subnet_ids
 }
 
-output "nat_public_ips" {
-  value = module.vpc.nat_public_ips
+output "public_route_table_id" {
+  value = module.vpc.public_route_table_id
+}
+
+output "app_route_table_ids" {
+  value = module.vpc.app_route_table_ids
+}
+
+output "db_route_table_id" {
+  value = module.vpc.db_route_table_id
 }

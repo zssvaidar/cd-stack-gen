@@ -27,14 +27,10 @@ output "public_route_table_id" {
 }
 
 output "app_route_table_ids" {
-  value = aws_route_table.app[*].id
+  description = "One per AZ, in azs order - the NAT instance layer adds its 0.0.0.0/0 route to these."
+  value       = aws_route_table.app[*].id
 }
 
 output "db_route_table_id" {
   value = aws_route_table.db.id
-}
-
-output "nat_public_ips" {
-  description = "Egress IPs the app tier's outbound traffic comes from - allowlist these on anything external."
-  value       = aws_eip.nat[*].public_ip
 }

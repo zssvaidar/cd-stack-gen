@@ -37,7 +37,7 @@ project-13/
 
 ./run.sh dev network plan
 ./run.sh dev network apply
-./run.sh dev network output        # vpc_id, subnet ids, NAT egress IPs
+./run.sh dev network output        # vpc_id, subnet ids, route table ids
 
 ./run.sh prod network plan
 ./run.sh prod network apply
@@ -71,17 +71,18 @@ project-12 had to patch in after the fact with its `rds-standby`/`alb-standby` s
 
 | Tier | Subnets (`10.x` = env's /16) | Route | For |
 |---|---|---|---|
-| public | `10.x.0.0/24`, `10.x.1.0/24` | `0.0.0.0/0` → Internet Gateway | ALBs, NAT Gateways, bastion |
-| app | `10.x.10.0/24`, `10.x.11.0/24` | `0.0.0.0/0` → NAT Gateway (per `nat_mode`) | ECS tasks, EC2 |
+| public | `10.x.0.0/24`, `10.x.1.0/24` | `0.0.0.0/0` → Internet Gateway | ALBs, NAT instances, bastion |
+| app | `10.x.10.0/24`, `10.x.11.0/24` | VPC-local only, until a NAT instance layer adds `0.0.0.0/0` | ECS tasks, EC2 |
 | db | `10.x.20.0/24`, `10.x.21.0/24` | VPC-local only, no internet route | RDS |
 
 Also:
-- **`nat_mode`** - `none` / `single` / `per_az`. Managed NAT Gateways replace project-11's
-  self-run NAT instance. dev uses `single` (one gateway; an AZ outage cuts dev's outbound
-  internet - acceptable), prod uses `per_az` (each AZ's app subnet goes out through its own
-  gateway).
+- **No NAT in this layer.** Outbound internet for the app tier will come from self-managed NAT
+  instances (like project-11's egress gateway), not managed NAT Gateways. Those get their own
+  layer; it adds a `0.0.0.0/0` route to each app route table (one per AZ, exported as
+  `app_route_table_ids`) pointing at its instance's network interface. Until then, app subnets
+  reach only the VPC and S3.
 - **S3 gateway endpoint** on the app/db route tables - free, and ECR image layers are pulled
-  from S3, so Fargate image pulls skip the NAT (and its per-GB charge).
+  from S3, so Fargate image pulls skip the NAT instance.
 - **Default security group locked down** - every rule stripped, so anything launched without
   an explicit SG gets no access rather than AWS's default allow-all-between-members.
 - No tier security groups here (unlike project-11's `manage_network.sh`). SGs belong to the
@@ -90,11 +91,8 @@ Also:
 
 ## Cost
 
-Mostly free (VPC, subnets, route tables, IGW, S3 endpoint). The exception is **NAT Gateways:
-about $0.062/hour each in ap-northeast-1 (≈ $45/month) plus per-GB processing** - dev has
-1, prod has 2, so ~$135/month with both envs up and idle. To keep a VPC up for free while not
-using it, set `nat_mode = "none"` in that env's `main.tf` and apply; or
-`./run.sh <env> network destroy` and recreate later (subnet IDs will change).
+Free: VPC, subnets, route tables, the internet gateway and the S3 gateway endpoint cost
+nothing. The paid parts (NAT instances, then the app layers) come in later steps.
 
 ## State bucket (`bootstrap/`)
 
@@ -113,5 +111,5 @@ terraform test
 ```
 
 Runs entirely offline against a mock AWS provider: checks the subnet CIDR layout, that subnets
-land in distinct AZs, the NAT count and routing for each `nat_mode`, and that a non-/16 CIDR
+land in distinct AZs, the per-AZ app route tables, IGW routing, S3 endpoint attachment, and that a non-/16 CIDR
 is rejected.

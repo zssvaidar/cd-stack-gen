@@ -2,9 +2,13 @@
 # az_count AZs from the start (project-12 had to bolt on "standby" subnets for RDS/ALB because
 # project-11's subnets were all created without an explicit AZ):
 #
-#   public  10.x.0.0/24,  10.x.1.0/24, ...   IGW-routed - ALBs, NAT Gateways, bastion
-#   app     10.x.10.0/24, 10.x.11.0/24, ...  private - ECS tasks / EC2, outbound via NAT
+#   public  10.x.0.0/24,  10.x.1.0/24, ...   IGW-routed - ALBs, NAT instances, bastion
+#   app     10.x.10.0/24, 10.x.11.0/24, ...  private - ECS tasks / EC2, outbound via NAT instance
 #   db      10.x.20.0/24, 10.x.21.0/24, ...  private, no internet route at all - RDS
+#
+# No NAT here - outbound internet for the app tier comes from self-managed NAT instances (as in
+# project-11's egress gateway), owned by their own layer. That layer adds the 0.0.0.0/0 route to
+# each app route table (app_route_table_ids output) pointing at its instance's ENI.
 
 data "aws_availability_zones" "available" {
   state = "available"
@@ -21,12 +25,6 @@ locals {
   public_offset = 0
   app_offset    = 10
   db_offset     = 20
-
-  nat_count = {
-    none   = 0
-    single = 1
-    per_az = var.az_count
-  }[var.nat_mode]
 }
 
 resource "aws_vpc" "this" {
@@ -125,30 +123,8 @@ resource "aws_route_table_association" "public" {
 }
 
 # --------------------------------------------------
-# NAT (managed NAT Gateway, not project-11's NAT instance)
-# --------------------------------------------------
-
-resource "aws_eip" "nat" {
-  count = local.nat_count
-
-  domain = "vpc"
-
-  tags = merge(var.tags, { Name = "${var.name}-nat-${local.azs[count.index]}" })
-}
-
-resource "aws_nat_gateway" "this" {
-  count = local.nat_count
-
-  allocation_id = aws_eip.nat[count.index].id
-  subnet_id     = aws_subnet.public[count.index].id
-
-  tags = merge(var.tags, { Name = "${var.name}-nat-${local.azs[count.index]}" })
-
-  depends_on = [aws_internet_gateway.this]
-}
-
-# --------------------------------------------------
-# App routing - one route table per AZ, so per_az NAT can send each AZ through its own gateway
+# App routing - one route table per AZ, so each AZ can go out through its own NAT instance.
+# Starts with only the local VPC route; the NAT layer adds the default route.
 # --------------------------------------------------
 
 resource "aws_route_table" "app" {
@@ -160,14 +136,6 @@ resource "aws_route_table" "app" {
     Name = "${var.name}-app-${local.azs[count.index]}"
     Tier = "app"
   })
-}
-
-resource "aws_route" "app_nat" {
-  count = local.nat_count > 0 ? var.az_count : 0
-
-  route_table_id         = aws_route_table.app[count.index].id
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.this[var.nat_mode == "per_az" ? count.index : 0].id
 }
 
 resource "aws_route_table_association" "app" {

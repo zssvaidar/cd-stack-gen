@@ -44,58 +44,26 @@ run "subnet_layout" {
   }
 }
 
-run "single_nat_shared_by_every_az" {
+run "routing" {
   command = apply
 
   variables {
-    nat_mode = "single"
-  }
-
-  assert {
-    condition     = length(aws_nat_gateway.this) == 1
-    error_message = "single mode should create exactly one NAT Gateway"
-  }
-
-  assert {
-    condition     = length(aws_route.app_nat) == 2
-    error_message = "every app route table should get a default route"
-  }
-
-  assert {
-    condition     = alltrue([for r in aws_route.app_nat : r.nat_gateway_id == aws_nat_gateway.this[0].id])
-    error_message = "every app route should point at the one NAT Gateway"
-  }
-}
-
-run "per_az_nat" {
-  command = apply
-
-  variables {
-    nat_mode = "per_az"
     az_count = 3
   }
 
   assert {
-    condition     = length(aws_nat_gateway.this) == 3
-    error_message = "per_az mode should create one NAT Gateway per AZ"
+    condition     = length(aws_route_table.app) == 3
+    error_message = "one app route table per AZ, so each AZ's NAT instance can be routed separately"
   }
 
   assert {
-    condition     = [for r in aws_route.app_nat : r.nat_gateway_id] == aws_nat_gateway.this[*].id
-    error_message = "each AZ's app route should point at its own AZ's NAT Gateway"
-  }
-}
-
-run "no_nat" {
-  command = plan
-
-  variables {
-    nat_mode = "none"
+    condition     = aws_route.public_internet.route_table_id == aws_route_table.public.id && aws_route.public_internet.gateway_id == aws_internet_gateway.this.id
+    error_message = "the public route table's default route should go via the IGW"
   }
 
   assert {
-    condition     = length(aws_nat_gateway.this) == 0 && length(aws_route.app_nat) == 0
-    error_message = "none mode should create no NAT Gateway and no app default route"
+    condition     = toset(aws_vpc_endpoint.s3[0].route_table_ids) == toset(concat(aws_route_table.app[*].id, [aws_route_table.db.id]))
+    error_message = "the S3 endpoint should be attached to every app route table and the db route table"
   }
 }
 

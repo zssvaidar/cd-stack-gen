@@ -40,7 +40,4 @@ module "vpc" {
   name     = "prod"
   cidr     = "10.20.0.0/16"
   az_count = 2
-
-  # one NAT Gateway per AZ, so losing one AZ doesn't cut outbound internet for the other
-  nat_mode = "per_az"
 }
