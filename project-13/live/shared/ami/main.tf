@@ -73,10 +73,30 @@ module "egress_gateway" {
   tags             = merge(local.tags, { Role = "egress-gateway" })
 }
 
+# nginx :80 -> Node.js app on 127.0.0.1:3000, smoke-tested at build time - see
+# ami-scripts/README.md (nodejs.sh)
+module "nodejs" {
+  source = "../../../modules/ami"
+
+  name             = "nodejs"
+  provision_script = "${local.ami_scripts}/nodejs.sh"
+  subnet_id        = data.terraform_remote_state.dev_network.outputs.public_subnet_ids[0]
+  region           = var.region
+  tags             = merge(local.tags, { Role = "nodejs" })
+}
+
 output "egress_gateway_ami_id" {
   value = module.egress_gateway.ami_id
 }
 
 output "egress_gateway_ami_name" {
   value = module.egress_gateway.ami_name
+}
+
+output "nodejs_ami_id" {
+  value = module.nodejs.ami_id
+}
+
+output "nodejs_ami_name" {
+  value = module.nodejs.ami_name
 }

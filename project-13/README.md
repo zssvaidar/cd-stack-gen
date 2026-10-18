@@ -8,11 +8,11 @@ into that environment, each layer in its own root module with its own state.
 Built step by step:
 
 1. The state bucket and the dev/prod VPCs.
-2. **(this)** Modules for baking an AMI from `ami-scripts/*.sh` and launching instances from
-   it, plus a `shared/ami` layer that builds the egress-gateway image.
+2. Modules for baking an AMI from `ami-scripts/*.sh` and launching instances from it.
+3. **(this)** Images in `shared/ami` (egress-gateway, nodejs), NAT instances per env, and the
+   Node.js app on plain EC2 instances per env.
 
-Next: NAT instances per env from that image, then the app layers (ECS cluster, RDS,
-bun-hydrate services), each reading the network's outputs rather than creating their own.
+Next: a load balancer in front of the app, then the ECS/RDS/bun-hydrate layers.
 
 ```
 project-13/
@@ -25,11 +25,25 @@ project-13/
     ami/                      bake an AMI from an ami-scripts/*.sh (runs Packer)
       packer/ami.pkr.hcl
     instance/                 launch N instances from an AMI
+    nat/                      NAT instances + the app tier's default routes (uses instance/)
     */tests/*.tftest.hcl      offline tests (mock provider, no AWS creds)
-  live/
-    shared/ami/               images used by every env - state key shared/ami.tfstate
-    dev/network/              dev VPC   - 10.10.0.0/16, state key dev/network.tfstate
-    prod/network/             prod VPC  - 10.20.0.0/16, state key prod/network.tfstate
+  live/                       one folder per deployment, each its own state <env>/<layer>.tfstate
+    shared/ami/               images used by every env: egress-gateway, nodejs
+    dev/network/              dev VPC   - 10.10.0.0/16
+    dev/nat/                  1 NAT instance, shared by both AZs
+    dev/app/                  1 Node.js instance
+    prod/network/             prod VPC  - 10.20.0.0/16
+    prod/nat/                 2 NAT instances, one per AZ
+    prod/app/                 2 Node.js instances, one per AZ
+```
+
+Layers depend on each other only through state outputs (`terraform_remote_state`), so apply
+them in order:
+
+```
+network ──┬──────────────► nat ──► app
+          └─► shared/ami ──┘        ▲
+                    └───────────────┘
 ```
 
 ## Prerequisites
@@ -54,9 +68,18 @@ project-13/
 ./run.sh prod network plan
 ./run.sh prod network apply
 
-./run.sh shared ami apply          # needs dev network applied - the builder runs in its public subnet
-./run.sh shared ami output         # egress_gateway_ami_id
+./run.sh shared ami apply          # needs dev network - the builders run in its public subnet
+./run.sh shared ami output         # egress_gateway_ami_id, nodejs_ami_id
+
+./run.sh dev nat apply             # NAT instance + app subnets' 0.0.0.0/0 routes
+./run.sh dev app apply             # Node.js instance(s) - after nat, see below
+
+./run.sh prod nat apply
+./run.sh prod app apply
 ```
+
+Tear down in reverse: `app`, `nat`, then `network`. `network` can't be destroyed while
+instances are still in its subnets. `shared ami` destroy deregisters the images.
 
 `run.sh <env> <layer> <action>` runs `terraform init` with the right backend config on first
 use, then the action in `live/<env>/<layer>`. Anything after the action is passed through
@@ -174,14 +197,72 @@ with no SSH key and no inbound rule. Optional settings: `elastic_ip`, `associate
 Instances are immutable: a new `ami_id` or `user_data` replaces them (new one first, then
 the old one goes), rather than patching in place.
 
+## NAT (`modules/nat`, `live/<env>/nat`)
+
+The app subnets have no internet route of their own (see the VPC module). `modules/nat`
+supplies one:
+
+- `modules/instance` with the egress-gateway image in the **public** subnets, with
+  source/dest check off, an Elastic IP each, and all traffic allowed in from the VPC CIDR.
+  The image applies its NAT rules at boot (nftables masquerade, see
+  `ami-scripts/egress-gateway.sh`), so it needs no user data.
+- An `aws_route` `0.0.0.0/0` on each app route table pointing at a NAT instance's network
+  interface. Route table *i* uses instance *i % count*. With one instance per AZ, each AZ
+  goes out through its own instance; with one instance, both AZs share it.
+
+| | instances | if an AZ goes down |
+|---|---|---|
+| dev | 1 | dev's app tier loses outbound internet until it's back |
+| prod | 2 (one per AZ) | the other AZ keeps its own way out |
+
+`./run.sh <env> nat output` shows `public_ips`: the app tier's egress IPs, to allowlist on
+anything external. A new egress-gateway image replaces the instances: the new instance comes
+up first, then the route and the Elastic IP move to it, so the IP stays the same.
+
+## App (`live/<env>/app`)
+
+The Node.js image (`ami-scripts/nodejs.sh`: nginx on `:80` → Node on `127.0.0.1:3000`, with
+`/health`), launched with `modules/instance` in the **private app subnets**, one per AZ (dev 1,
+prod 2). Each instance has no public IP. Its security group allows only port 80, and only from
+inside the VPC. Each also gets an SSM role.
+
+**Apply `nat` first.** With no NAT the instances still boot and serve, but the SSM agent can't
+reach AWS to register, so you can't connect to them.
+
+There's no load balancer yet (next step). To reach the app now, use an SSM port forward
+through your machine:
+
+```bash
+id=$(./run.sh dev app output -json instance_ids | jq -r '.[0]')
+aws ssm start-session --target "$id" \
+    --document-name AWS-StartPortForwardingSession \
+    --parameters portNumber=80,localPortNumber=8080
+# other terminal:
+curl localhost:8080/health      # {"status":"ok","service":"node-app"}
+```
+
+This needs the [session-manager-plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
+installed locally. `aws ssm start-session --target "$id"` alone gives a shell.
+
+To deploy a new app version, change `ami-scripts/nodejs.sh` (or point it at your real app),
+then run `./run.sh shared ami apply` followed by `./run.sh <env> app apply`. The
+instances are replaced from the new image: dev first, then prod, with the same image.
+
 ## Cost
 
-- **Network: free.** VPC, subnets, route tables, the internet gateway and the S3 gateway
-  endpoint cost nothing.
-- **Each AMI: about $0.40/month.** That's snapshot storage for an 8 GiB root volume at about
-  $0.05/GB-month, plus a few minutes of a t3.micro builder per build.
-- **Instances** cost whatever their instance type costs, plus $0.005/hour for each public
-  IPv4 address, Elastic IPs included.
+Rough on-demand prices in ap-northeast-1:
+
+| | each | dev | prod |
+|---|---|---|---|
+| Network | free | - | - |
+| NAT instance (t3.micro) + Elastic IP | ≈ $10 + $3.60/month | 1 | 2 |
+| App instance (t3.micro) | ≈ $10/month | 1 | 2 |
+| AMI snapshot (8 GiB) | ≈ $0.40/month | 2 images, shared | |
+
+That comes to about $24/month for dev, $47/month for prod, and under $1 for the images,
+plus EBS root volumes at about $0.80 per instance. NAT instances also have no per-GB
+processing fee, which a NAT Gateway would charge. `./run.sh <env> app destroy` and
+`./run.sh <env> nat destroy` stop the charges and leave the network in place.
 
 ## State bucket (`bootstrap/`)
 
@@ -194,7 +275,7 @@ Losing that file is harmless - the bucket just isn't Terraform-managed until you
 ## Tests
 
 ```bash
-for m in vpc ami instance; do (cd modules/$m && terraform init && terraform test); done
+for m in vpc ami instance nat; do (cd modules/$m && terraform init && terraform test); done
 ```
 
 All offline against a mock AWS provider, no credentials:
@@ -207,3 +288,5 @@ All offline against a mock AWS provider, no credentials:
   `packer validate -var-file=<vars> modules/ami/packer`.
 - **instance:** IMDSv2, encryption, SSM role, round-robin subnet placement, and the NAT-style
   settings (EIP per instance, source/dest check off, VPC-wide inbound rule, no role).
+- **nat:** one shared instance routes both AZs; one per AZ routes each AZ to its own; more
+  instances than AZs is rejected.
