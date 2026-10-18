@@ -101,9 +101,11 @@ bake/launch/DNS walk-through.
 
 `laravel.sh`, `spring.sh`, `csharp.sh` and `go.sh` bake [project-14](../../project-14/)'s four
 apps onto plain EC2 instances, one image each (`run.sh ami <name> laravel|spring|csharp|go create`).
-They share `nodejs.sh`'s shape: nginx on `:80` in front, the app as a systemd service on
-`127.0.0.1:8080` (Laravel: php-fpm on a unix socket), and a build-time smoke test of the app's
-readiness endpoint through nginx. They also share `docker.sh`'s source handling: the app is
+They share `nodejs_caddy.sh`'s shape and its pinned, checksum-verified Caddy install: Caddy on
+`:80` in front, the app as a systemd service on `127.0.0.1:8080` (Laravel: php-fpm on a unix
+socket, reached through `php_fastcgi`), and a build-time smoke test of the app's readiness endpoint
+through Caddy. Caddy trusts `X-Forwarded-For` from private ranges, so behind a load balancer the
+app sees the real client IP. They also share `docker.sh`'s source handling: the app is
 fetched from `APP_SOURCE`, which defaults to this repo's git URL at `APP_REF=master`. That can be
 an `s3://` tarball instead, or a private git repo with `APP_GIT_TOKEN_PARAM`. `APP_SUBDIR` picks
 the app's folder. The app is built on the builder, and the build toolchain is removed again before
@@ -119,11 +121,11 @@ target group at `/health/ready` (Spring: `/actuator/health/readiness`).
 All four app images also install **Grafana Alloy**. The installer, `project-14/monitoring/alloy/install.sh`,
 comes from the same checkout and uses one shared `config.alloy`. Alloy ships host metrics, the app's
 Prometheus metrics, a blackbox probe of the health URL, and the journal of the app's units (including
-nginx's access log, which also goes to syslog). It sends them to the monitoring host built by
+Caddy's JSON access log, which goes to the journal). It sends them to the monitoring host built by
 `grafana.sh`, labelled `app`/`env`/`host`. It ships switched off: `alloy.service` only starts once
 `/etc/alloy/endpoint.env` exists. Write that file from user-data (`MONITORING_HOST=<ip>`,
 optionally `ENVIRONMENT=dev`), or run `sudo alloy-endpoint <ip> dev` on a running instance. The app's
-metrics endpoint is scraped on loopback and returns 404 through nginx.
+metrics endpoint is scraped on loopback and returns 404 through Caddy.
 
 `grafana.sh` is that monitoring host: Grafana on `:3000`, **Mimir** on `:9009` (Prometheus-compatible
 metrics store, receives Alloy's remote-write) and **Loki** on `:3100` (logs), all from Grafana's

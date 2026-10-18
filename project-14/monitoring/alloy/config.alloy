@@ -53,7 +53,7 @@ prometheus.scrape "host" {
 }
 
 // ---------------------------------------------------------------------------
-// The app's own metrics, scraped on loopback - never through nginx, which hides them
+// The app's own metrics, scraped on loopback - never through Caddy, which hides them
 // ---------------------------------------------------------------------------
 
 prometheus.scrape "app" {
@@ -67,7 +67,7 @@ prometheus.scrape "app" {
 }
 
 // ---------------------------------------------------------------------------
-// Health: probe the same URL a load balancer would, through nginx
+// Health: probe the same URL a load balancer would, through Caddy
 // ---------------------------------------------------------------------------
 
 prometheus.exporter.blackbox "health" {
@@ -89,7 +89,7 @@ prometheus.scrape "health" {
 
 // ---------------------------------------------------------------------------
 // Logs: the journal, kept to the app's units (LOG_UNITS is a regex, e.g.
-// "go-app.service|nginx.service"). The alloy user is in systemd-journal (rpm postinstall).
+// "go-app.service|caddy.service"). The alloy user is in systemd-journal (rpm postinstall).
 // ---------------------------------------------------------------------------
 
 loki.relabel "journal" {

@@ -46,7 +46,7 @@ app.MapHealthChecks("/health/ready", new HealthCheckOptions
     ResponseWriter = WriteJson,
 });
 
-// Prometheus metrics. Behind nginx on the AMIs this path is blocked; Alloy scrapes it on loopback.
+// Prometheus metrics. Behind Caddy on the AMIs this path is blocked; Alloy scrapes it on loopback.
 app.MapMetrics("/metrics");
 
 app.Run();

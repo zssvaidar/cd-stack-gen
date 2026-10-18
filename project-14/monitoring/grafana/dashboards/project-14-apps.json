@@ -101,7 +101,7 @@
     {
       "id": 1,
       "type": "stat",
-      "title": "Health (probe through nginx)",
+      "title": "Health (probe through Caddy)",
       "datasource": {
         "type": "prometheus",
         "uid": "mimir"

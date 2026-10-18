@@ -1,7 +1,7 @@
 #!/bin/bash
-# project-14's Laravel app (project-14/laravel-app) run directly on the instance: nginx on :80
-# -> php-fpm over a unix socket, smoke-tested through nginx before snapshot. Same shape as
-# nodejs.sh. The container version of the same app is project-14/laravel-app/Dockerfile.
+# project-14's Laravel app (project-14/laravel-app) run directly on the instance: Caddy on :80
+# -> php-fpm over a unix socket, smoke-tested through Caddy before snapshot. Same shape as
+# nodejs_caddy.sh. The container version of the same app is project-14/laravel-app/Dockerfile.
 #
 # Composer dependencies are installed on the builder (no dev packages) and Composer removed
 # again. Frontend assets are not built - the welcome page falls back to inline styles without a
@@ -84,7 +84,7 @@ done
 [[ -n "$php" ]] || { echo "laravel.sh: none of PHP $PHP_VERSIONS is available from dnf" >&2; exit 1; }
 log "using $php"
 
-retry_pkg dnf install -y nginx git unzip tar \
+retry_pkg dnf install -y git unzip tar \
     "$php-cli" "$php-fpm" "$php-common" "$php-mbstring" "$php-xml" "$php-pdo" \
     "$php-mysqlnd" "$php-pgsql" "$php-opcache" "$php-process" "$php-intl"
 # Nice to have, not needed by the skeleton - don't fail the build if a line lacks one.
@@ -256,9 +256,9 @@ EOF
 
 
 # --------------------------------------------------
-# php-fpm: one pool for the app, as $APP_USER, on a socket only nginx can reach. The distro's
+# php-fpm: one pool for the app, as $APP_USER, on a socket only Caddy can reach. The distro's
 # "www" pool (as apache) is dropped. Logs go to syslog (the journal). The pool's status page
-# feeds Alloy's metrics scrape (OpenMetrics, see nginx below).
+# feeds Alloy's metrics scrape (OpenMetrics, see Caddy below).
 # --------------------------------------------------
 
 rm -f /etc/php-fpm.d/www.conf
@@ -269,8 +269,8 @@ cat > /etc/php-fpm.d/$APP_NAME.conf <<EOF
 user = $APP_USER
 group = $APP_USER
 listen = $FPM_SOCK
-listen.owner = nginx
-listen.group = nginx
+listen.owner = caddy
+listen.group = caddy
 listen.mode = 0660
 
 pm = dynamic
@@ -290,62 +290,112 @@ systemctl enable $APP_NAME-init.service php-fpm.service
 
 
 # --------------------------------------------------
-# nginx: :80 -> php-fpm, Laravel-style front controller. Access log to the journal too (for
-# Loki), health probes kept out of both. 127.0.0.1:9180/metrics serves php-fpm's status page
-# as OpenMetrics, for Alloy only - /fpm-status isn't reachable through :80 (it falls through to
-# Laravel's 404).
+# Caddy: :80 -> php-fpm (php_fastcgi, Laravel's front controller) and static files from
+# public/. Access log (JSON) to the journal for Loki, health probes left out.
+# 127.0.0.1:9180/metrics serves php-fpm's status page as OpenMetrics, for Alloy only.
+# Installed like nodejs_caddy.sh: the official release tarball (Caddy isn't in Amazon Linux's
+# repos), pinned with sha512 from caddy_<version>_checksums.txt - bump both scripts together.
 # --------------------------------------------------
 
-cat > /etc/nginx/conf.d/app.conf <<EOF
-map \$request_uri \$app_loggable {
-    ~^/(health|up)  0;
-    default         1;
+CADDY_VERSION=2.10.2
+declare -A CADDY_SHA512=(
+    [amd64]=747df7ee74de188485157a383633a1a963fd9233b71fbb4a69ddcbcc589ce4e2cc82dacf5dbbe136cb51d17e14c59daeb5d9bc92487610b0f3b93680b2646546
+    [arm64]=6ce061a690312ab38367df3c5d5f89a2e4a263e7300d300d87356211bb81e79b15933e6d6203e03fbf26f15cc0311f264805f336147dbdd24938d84b57a4421c
+)
+
+case "$(uname -m)" in
+    x86_64) caddy_arch=amd64 ;;
+    aarch64) caddy_arch=arm64 ;;
+    *) echo "laravel.sh: unsupported architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
+caddy_tgz=$(mktemp)
+curl -fsSL --retry 5 -o "$caddy_tgz" \
+    "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_linux_${caddy_arch}.tar.gz"
+echo "${CADDY_SHA512[$caddy_arch]}  $caddy_tgz" | sha512sum -c --quiet - \
+    || { echo "laravel.sh: checksum mismatch for caddy $CADDY_VERSION" >&2; exit 1; }
+tar -xzf "$caddy_tgz" -C /usr/local/bin caddy
+chmod 0755 /usr/local/bin/caddy
+rm -f "$caddy_tgz"
+
+# runs unprivileged; its home is where Caddy keeps its data (certificates, if TLS is turned on)
+useradd --system --home-dir /var/lib/caddy --create-home --shell /sbin/nologin caddy 2>/dev/null || true
+
+mkdir -p /etc/caddy
+cat > /etc/caddy/Caddyfile <<EOF
+{
+	# Behind a load balancer: trust X-Forwarded-For from private ranges, so the app sees the
+	# real client IP rather than the balancer's.
+	servers {
+		trusted_proxies static private_ranges
+	}
 }
 
-server {
-    listen 80 default_server;
-    server_name _;
-    root $APP_DIR/public;
-    index index.php;
-    client_max_body_size 20m;
+# ":80" = any hostname, plain HTTP - a bare port gets no automatic HTTPS (see nodejs_caddy.sh).
+:80 {
+	root * $APP_DIR/public
+	encode
 
-    access_log /var/log/nginx/access.log combined if=\$app_loggable;
-    access_log syslog:server=unix:/dev/log,tag=nginx,nohostname combined if=\$app_loggable;
+	# access log (JSON) to stderr -> journal (caddy.service) -> Alloy -> Loki; probes left out
+	log
+	@probes path /health /health/* /up
+	log_skip @probes
 
-    location / {
-        try_files \$uri \$uri/ /index.php?\$query_string;
-    }
-
-    location ~ \.php\$ {
-        try_files \$uri =404;
-        fastcgi_pass unix:$FPM_SOCK;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
-        fastcgi_param DOCUMENT_ROOT \$realpath_root;
-    }
-
-    location ~ /\.(?!well-known) {
-        deny all;
-    }
+	# index.php front controller, like Laravel's own docs for Caddy
+	php_fastcgi unix/$FPM_SOCK
+	file_server {
+		hide .*
+	}
 }
 
-server {
-    listen 127.0.0.1:9180;
-    access_log off;
+# php-fpm's status page as OpenMetrics, for Alloy only. /fpm-status itself isn't reachable on
+# :80 - it isn't a file, so php_fastcgi hands it to Laravel, which 404s.
+http://127.0.0.1:9180 {
+	bind 127.0.0.1
+	log_skip
 
-    location = /metrics {
-        fastcgi_pass unix:$FPM_SOCK;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_NAME /fpm-status;
-        fastcgi_param SCRIPT_FILENAME /fpm-status;
-        fastcgi_param REQUEST_URI /fpm-status;
-        fastcgi_param QUERY_STRING openmetrics;
-    }
+	handle /metrics {
+		rewrite * /fpm-status?openmetrics
+		reverse_proxy unix/$FPM_SOCK {
+			transport fastcgi {
+				# no site root here: name the status page directly, as php-fpm expects
+				env SCRIPT_NAME /fpm-status
+				env SCRIPT_FILENAME /fpm-status
+			}
+		}
+	}
+	respond 404
 }
 EOF
 
-nginx -t
-systemctl enable nginx.service
+/usr/local/bin/caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+# the upstream caddy.service, with the binary at /usr/local/bin
+cat > /etc/systemd/system/caddy.service <<'EOF'
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable caddy.service
 
 
 # --------------------------------------------------
@@ -357,7 +407,7 @@ systemctl enable nginx.service
 export APP_NAME
 APP_METRICS_ADDR=127.0.0.1:9180 APP_METRICS_PATH=/metrics \
 APP_HEALTH_URL=http://127.0.0.1/health/ready \
-LOG_UNITS="php-fpm.service|nginx.service|$APP_NAME-init.service" \
+LOG_UNITS="php-fpm.service|caddy.service|$APP_NAME-init.service" \
     bash "$SRC/$MONITORING_SUBDIR/alloy/install.sh"
 
 
@@ -369,7 +419,7 @@ rm -rf "$SRC" /tmp/composer /tmp/composer-home
 
 
 # --------------------------------------------------
-# Smoke test through nginx before this becomes a snapshotted image - then remove everything the
+# Smoke test through Caddy before this becomes a snapshotted image - then remove everything the
 # init generated (.env with its APP_KEY, the SQLite file, caches, logs) so each instance
 # generates its own on first boot.
 # --------------------------------------------------
@@ -377,7 +427,7 @@ rm -rf "$SRC" /tmp/composer /tmp/composer-home
 ok=true
 systemctl start $APP_NAME-init.service || ok=false
 systemctl start php-fpm.service || ok=false
-systemctl restart nginx.service || ok=false
+systemctl restart caddy.service || ok=false
 
 curl -fsS http://127.0.0.1/health/ready | grep -q '"database":"UP"' || ok=false
 curl -fsS -o /dev/null http://127.0.0.1/up || ok=false
@@ -385,16 +435,16 @@ curl -fsS -o /dev/null http://127.0.0.1/ || ok=false
 curl -fsS http://127.0.0.1:9180/metrics | grep -q '^phpfpm_up 1' || ok=false
 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/fpm-status | grep -q 404 || ok=false
 
-systemctl stop nginx.service php-fpm.service || true
+systemctl stop caddy.service php-fpm.service || true
 systemctl stop $APP_NAME-init.service || true
 
 if [[ "$ok" != "true" ]]; then
-    echo "laravel.sh: smoke test failed - app not reachable through nginx" >&2
-    journalctl -u $APP_NAME-init -u php-fpm --no-pager -n 50 >&2 || true
+    echo "laravel.sh: smoke test failed - app not reachable through Caddy" >&2
+    journalctl -u $APP_NAME-init -u php-fpm -u caddy --no-pager -n 50 >&2 || true
     tail -n 50 "$APP_DIR"/storage/logs/*.log /var/log/php-fpm/*.log >&2 2>/dev/null || true
     exit 1
 fi
-echo "laravel.sh: smoke test passed - app reachable through nginx"
+echo "laravel.sh: smoke test passed - app reachable through Caddy"
 
 # config/route/view/event caches only - packages.php + services.php came from composer and stay
 rm -f "$CONF_DIR/app.env" "$APP_DIR"/database/*.sqlite \

@@ -95,7 +95,7 @@ func newMux(ready *atomic.Bool) *http.ServeMux {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "UP"})
 	})
 
-	// Prometheus metrics (Go runtime, process, requests). Behind nginx on the AMIs this path is
+	// Prometheus metrics (Go runtime, process, requests). Behind Caddy on the AMIs this path is
 	// blocked; Alloy scrapes it on loopback.
 	mux.Handle("GET /metrics", promhttp.Handler())
 

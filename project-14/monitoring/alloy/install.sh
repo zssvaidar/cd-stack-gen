@@ -8,7 +8,7 @@
 #   APP_METRICS_ADDR   host:port of the app's Prometheus endpoint, e.g. 127.0.0.1:8080
 #   APP_METRICS_PATH   its path, e.g. /metrics
 #   APP_HEALTH_URL     URL the blackbox probe checks, e.g. http://127.0.0.1/health/ready
-#   LOG_UNITS          regex of systemd units whose journal is shipped, e.g. "go-app.service|nginx.service"
+#   LOG_UNITS          regex of systemd units whose journal is shipped, e.g. "go-app.service|caddy.service"
 #
 # Where to send it is decided at launch, not bake time: alloy.service only starts once
 # /etc/alloy/endpoint.env exists. Write it from user-data:

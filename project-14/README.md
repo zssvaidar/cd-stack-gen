@@ -58,7 +58,7 @@ For Graviton (arm64) tasks build with `docker buildx build --platform linux/arm6
 Each app also has a Packer provisioner script in
 [`project-11/ami-scripts/`](../project-11/ami-scripts/) (project-13 reads the same folder through its
 `ami-scripts` symlink). The script builds the app on the builder instance and runs it under systemd
-behind nginx on `:80`. It smoke-tests the app before the snapshot.
+behind Caddy on `:80`. It smoke-tests the app before the snapshot.
 
 | App | Script | Bake |
 |---|---|---|
@@ -78,7 +78,7 @@ the Laravel image generates its `APP_KEY` on first boot.
 app instance                                       monitoring instance (grafana.sh)
   Alloy ─ host metrics, app /metrics, ──:9009──▶  Mimir  ─┐
           health probe                                     ├─▶ Grafana :3000
-        ─ journal (app, nginx) ─────────:3100──▶  Loki   ─┘     "project-14 apps" dashboard
+        ─ journal (app, Caddy) ─────────:3100──▶  Loki   ─┘     "project-14 apps" dashboard
 ```
 
 Everything lives in [`monitoring/`](monitoring/) and is installed by the AMI scripts:
@@ -98,9 +98,9 @@ Each app exposes Prometheus metrics for Alloy to scrape on loopback:
 | spring-app | `/actuator/prometheus` (Micrometer) | `http_server_requests_seconds` (with histogram buckets) |
 | go-app | `/metrics` (`client_golang`) | `http_server_requests_seconds`, same name as Spring's |
 | csharp-app | `/metrics` (`prometheus-net`) | `http_request_duration_seconds` |
-| laravel-app | php-fpm's status page as OpenMetrics, on nginx `127.0.0.1:9180/metrics` (AMI only) | `phpfpm_accepted_connections`, `phpfpm_active_processes`, ... |
+| laravel-app | php-fpm's status page as OpenMetrics, on Caddy `127.0.0.1:9180/metrics` (AMI only) | `phpfpm_accepted_connections`, `phpfpm_active_processes`, ... |
 
-On the AMIs, nginx returns 404 for those paths on `:80`. In the containers nothing sits in front of
+On the AMIs, Caddy returns 404 for those paths on `:80`. In the containers nothing sits in front of
 the app, so keep `/metrics` and `/actuator/prometheus` off the public ALB (listener rules), or scrape
 them from an Alloy sidecar.
 
