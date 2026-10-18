@@ -5,19 +5,29 @@ network per `PURPOSE`. project-13 redoes the same ground in Terraform, the way i
 laid out in practice: **one VPC per environment (dev, prod)**, shared by every app deployed
 into that environment, each layer in its own root module with its own state.
 
-Built step by step. **Step 1 (this): the state bucket and the dev/prod VPCs.** App layers
-(ECS cluster, RDS, bun-hydrate services) come next, each reading the network's outputs rather
-than creating their own.
+Built step by step:
+
+1. The state bucket and the dev/prod VPCs.
+2. **(this)** Modules for baking an AMI from `ami-scripts/*.sh` and launching instances from
+   it, plus a `shared/ami` layer that builds the egress-gateway image.
+
+Next: NAT instances per env from that image, then the app layers (ECS cluster, RDS,
+bun-hydrate services), each reading the network's outputs rather than creating their own.
 
 ```
 project-13/
   run.sh                      wrapper creds + terraform, same shape as project-11/12's run.sh
   wrapper -> ../project-9/wrapper
+  ami-scripts -> ../project-11/ami-scripts
   bootstrap/                  S3 state bucket (local state - see below)
   modules/
     vpc/                      the one VPC module both envs use
-      tests/vpc.tftest.hcl    offline tests (mock provider, no AWS creds)
+    ami/                      bake an AMI from an ami-scripts/*.sh (runs Packer)
+      packer/ami.pkr.hcl
+    instance/                 launch N instances from an AMI
+    */tests/*.tftest.hcl      offline tests (mock provider, no AWS creds)
   live/
+    shared/ami/               images used by every env - state key shared/ami.tfstate
     dev/network/              dev VPC   - 10.10.0.0/16, state key dev/network.tfstate
     prod/network/             prod VPC  - 10.20.0.0/16, state key prod/network.tfstate
 ```
@@ -25,6 +35,8 @@ project-13/
 ## Prerequisites
 
 - Terraform >= 1.10 (S3-native state locking - no DynamoDB table).
+- [Packer](https://developer.hashicorp.com/packer/install) on PATH, for `shared ami` only
+  (`modules/ami` runs it).
 - `wrapper/config/.env` filled in with the creator credentials, same as project-11/12
   (`cp wrapper/config/.env.example wrapper/config/.env` if you haven't already - it's the
   same shared file, via the symlink).
@@ -41,12 +53,17 @@ project-13/
 
 ./run.sh prod network plan
 ./run.sh prod network apply
+
+./run.sh shared ami apply          # needs dev network applied - the builder runs in its public subnet
+./run.sh shared ami output         # egress_gateway_ami_id
 ```
 
 `run.sh <env> <layer> <action>` runs `terraform init` with the right backend config on first
 use, then the action in `live/<env>/<layer>`. Anything after the action is passed through
 (`./run.sh prod network plan -out=prod.tfplan`). Override the bucket name with
-`TF_STATE_BUCKET=...` and the region with `AWS_REGION=...` (default `ap-northeast-1`).
+`TF_STATE_BUCKET=...` and the region with `AWS_REGION=...` (default `ap-northeast-1`). Both
+reach every root as `TF_VAR_region`/`TF_VAR_state_bucket`; a root that reads another layer's
+outputs (`terraform_remote_state`) declares `variable "state_bucket"` to get the bucket name.
 
 ## Why this layout
 
@@ -89,10 +106,82 @@ Also:
   layer that owns the thing they protect - the ECS layer creates its task SG, the RDS layer
   its DB SG - so they're created and destroyed together with it.
 
+## `modules/ami` - bake an image from `ami-scripts/*.sh`
+
+Terraform has no resource that runs a script on a machine and snapshots it, so this module
+drives **Packer** - the same build project-11's `run.sh ami` did, with the same
+`ami-scripts/*.sh` (symlinked in), just triggered and tracked by Terraform:
+
+```hcl
+module "egress_gateway" {
+  source           = "../../../modules/ami"
+  name             = "egress-gateway"
+  provision_script = "${path.root}/../../../ami-scripts/egress-gateway.sh"
+  subnet_id        = <a public subnet>          # where the temporary builder runs
+  region           = var.region
+  # provision_env  = ["KEY=value"]              # exported to the script; not for secrets
+  # base_ami_id    = "ami-..."                  # default: latest Amazon Linux 2023
+}
+# -> module.egress_gateway.ami_id
+```
+
+How it works (`modules/ami/main.tf`):
+
+- A `terraform_data` resource runs `packer init/validate/build` against
+  `modules/ami/packer/ami.pkr.hcl`. Packer launches a temporary builder in `subnet_id` with a
+  public IP and a temporary SG (SSH only from your machine's IP) and a temporary key, waits
+  for cloud-init, runs the script as root, snapshots, and cleans everything up - including on
+  failure.
+- The AMI is tagged `BuildId = <terraform_data id>`; `data.aws_ami` finds it by that tag, so
+  `ami_id` is an ordinary output other layers can use.
+- **When it rebuilds:** when the script's content, `provision_env`, `name`, the base AMI or
+  the Packer template change. Plan shows `terraform_data.build must be replaced`. With the
+  default base image, a new Amazon Linux 2023 release also triggers a rebuild; pin
+  `base_ami_id` to stop that.
+- **Old images are cleaned up:** a rebuild registers the new AMI first, then deregisters the
+  old one and deletes its snapshots. `destroy` does the same. Instances already running from
+  an old AMI keep running.
+- Debugging a failing script: run Packer by hand with `-on-error=ask` against
+  `modules/ami/packer` (see `project-11/ami-scripts/README.md`).
+
+`live/shared/ami` uses it for the egress-gateway image. Images live in a `shared` layer, not
+per env: built once, the same image goes to dev and then prod.
+
+## `modules/instance` - launch from an image
+
+```hcl
+module "nat" {
+  source            = "../../../modules/instance"
+  name              = "dev-nat"
+  ami_id            = <module.ami.ami_id, or from shared/ami's remote state>
+  vpc_id            = <network output>
+  subnet_ids        = <network public_subnet_ids>   # round-robin: instance i -> subnet_ids[i % n]
+  instance_count    = 1
+  source_dest_check = false                         # NAT/router
+  elastic_ip        = true
+  ingress_rules = [{ description = "from VPC", protocol = "-1", from_port = 0, to_port = 0,
+                     cidr_blocks = ["10.10.0.0/16"] }]
+}
+# -> instance_ids, private_ips, public_ips, primary_network_interface_ids, security_group_id
+```
+
+Every instance gets IMDSv2 only, an encrypted gp3 root volume, and its own security group:
+`ingress_rules` in, empty by default, and all traffic out. By default (`ssm_access = true`) it
+also gets an IAM role with `AmazonSSMManagedInstanceCore`, so `aws ssm start-session` works
+with no SSH key and no inbound rule. Optional settings: `elastic_ip`, `associate_public_ip`,
+`source_dest_check`, `key_name`, `user_data`, `iam_policy_arns`, `root_volume_size`.
+
+Instances are immutable: a new `ami_id` or `user_data` replaces them (new one first, then
+the old one goes), rather than patching in place.
+
 ## Cost
 
-Free: VPC, subnets, route tables, the internet gateway and the S3 gateway endpoint cost
-nothing. The paid parts (NAT instances, then the app layers) come in later steps.
+- **Network: free.** VPC, subnets, route tables, the internet gateway and the S3 gateway
+  endpoint cost nothing.
+- **Each AMI: about $0.40/month.** That's snapshot storage for an 8 GiB root volume at about
+  $0.05/GB-month, plus a few minutes of a t3.micro builder per build.
+- **Instances** cost whatever their instance type costs, plus $0.005/hour for each public
+  IPv4 address, Elastic IPs included.
 
 ## State bucket (`bootstrap/`)
 
@@ -105,11 +194,16 @@ Losing that file is harmless - the bucket just isn't Terraform-managed until you
 ## Tests
 
 ```bash
-cd modules/vpc
-terraform init
-terraform test
+for m in vpc ami instance; do (cd modules/$m && terraform init && terraform test); done
 ```
 
-Runs entirely offline against a mock AWS provider: checks the subnet CIDR layout, that subnets
-land in distinct AZs, the per-AZ app route tables, IGW routing, S3 endpoint attachment, and that a non-/16 CIDR
-is rejected.
+All offline against a mock AWS provider, no credentials:
+
+- **vpc:** subnet CIDR layout, subnets in distinct AZs, per-AZ app route tables, IGW
+  routing, S3 endpoint attachment, a non-/16 CIDR rejected.
+- **ami:** plan only, since an apply would run a real `packer build`. Covers the default AL2023
+  base image, pinning `base_ami_id`, and the script's hash as a rebuild trigger. The Packer
+  template itself is checked with
+  `packer validate -var-file=<vars> modules/ami/packer`.
+- **instance:** IMDSv2, encryption, SSM role, round-robin subnet placement, and the NAT-style
+  settings (EIP per instance, source/dest check off, VPC-wide inbound rule, no role).

@@ -4,6 +4,7 @@
 #
 #   run.sh bootstrap {init|plan|apply}                       the S3 state bucket (local state)
 #   run.sh <env> <layer> {init|plan|apply|destroy|output}    e.g. run.sh dev network apply
+#                                                            env "shared" = used by every env (AMIs)
 #
 # Every <env>/<layer> is its own root module under live/ with its own state key in the shared
 # bucket, so `run.sh dev network destroy` can never touch prod, and a later app layer can't
@@ -24,6 +25,12 @@ whoami
 AWS_REGION="${AWS_REGION:-ap-northeast-1}"
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 STATE_BUCKET="${TF_STATE_BUCKET:-cd-stack-gen-tfstate-$ACCOUNT_ID}"
+
+# Every root can declare `variable "region"` / `variable "state_bucket"` (the latter to read
+# another layer's outputs via terraform_remote_state). Passed as TF_VAR_* rather than -var since
+# terraform ignores TF_VAR_* for variables a root doesn't declare, but errors on an unknown -var.
+export TF_VAR_region="$AWS_REGION"
+export TF_VAR_state_bucket="$STATE_BUCKET"
 
 usage() {
     echo
@@ -74,7 +81,7 @@ case "${1:-}" in
             if [[ "$action" == output ]]; then
                 terraform -chdir="$dir" output "${@:4}"
             else
-                terraform -chdir="$dir" "$action" -var "region=$AWS_REGION" "${@:4}"
+                terraform -chdir="$dir" "$action" "${@:4}"
             fi
         fi
         ;;
